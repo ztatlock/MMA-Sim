@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Rust build artifacts
+target/
+*.so
+*.dylib

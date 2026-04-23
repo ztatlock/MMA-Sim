@@ -9,6 +9,10 @@ bit-exact regression corpus that any reimplementation must reproduce.
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 uv pip install torch numpy
+
+# For fastmma.rust_ref (Phase 2+):
+uv pip install maturin
+(cd fastmma_rust && maturin develop --release)
 ```
 
 ## Run
@@ -19,6 +23,9 @@ python -m bench.bench --only ampere-f16 --reps 5
 
 python -m bench.corpus                # write fixtures/<label>.pt (16 samples)
 python -m bench.corpus --samples 256  # bigger local run (don't commit)
+
+python -m bench.validate                        # numpy_ref vs oracle, bit-exact
+python -m bench.validate --impl fastmma.rust_ref  # rust_ref vs oracle
 ```
 
 Outputs of `bench.corpus` are torch.save'd bundles containing `{spec, samples}`

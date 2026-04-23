@@ -1,42 +1,193 @@
 //! Rust reimplementation of mmasim's mma path.
 //!
-//! Phase 2 scope: the Ampere f16×f16→f32 workhorse (m16n8k16, nfb=24,
-//! split-K). Ported 1:1 from `fastmma/numpy_ref.py`, using f64 ops
-//! instead of NumPy — so semantics are identical, but we pay no Python
-//! dispatch or NumPy allocation per call.
+//! Phase 2.1: integer fixed-point inner loop. Each input is decomposed
+//! from its raw f32 bits to a signed 64-bit integer at scale 2^nfb, with
+//! subnormal flush applied at the source dtype's min_exp. The fused-sum
+//! alignment and accumulation is done in pure integer arithmetic. Only
+//! the final per-output normalize uses f64 (for RZ rounding and f32 cast).
 //!
-//! All three inputs arrive as contiguous f32 arrays (the Python wrapper
-//! does the bf16/f16/tf32 → f32 cast before calling in; f32 is a strict
-//! superset of f16/bf16 so this is lossless).
+//! Inputs still arrive as contiguous f32 arrays (f32 is a strict superset
+//! of f16 / bf16 / tf32, so the cast is lossless). The wrapper passes
+//! each source dtype's min_exp; that's enough to recover bit-exact
+//! semantics.
 
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
 
 const F32_MIN_EXP: i32 = -126;
 
+/// Decompose an f32 value to (signed int_sig at scale 2^nfb, exp) with
+/// subnormal flush at `min_exp`. Returns `is_special=true` for NaN/Inf;
+/// caller must check the f64 pre-sum in that case.
 #[inline(always)]
-fn extract_sig_exp(x: f64, min_exp: i32) -> (f64, i32) {
-    // Mirrors fastmma/numpy_ref.py::_extract_sig_exp.
-    if x == 0.0 {
-        return (0.0, -126); // zero quirk
+fn decompose(v: f32, min_exp: i32, nfb: i32) -> (i64, i32, bool) {
+    let bits = v.to_bits();
+    let sign = (bits >> 31) & 1 != 0;
+    let biased_e = ((bits >> 23) & 0xFF) as i32;
+    let mant = (bits & 0x7F_FFFF) as i64;
+
+    if biased_e == 0xFF {
+        return (0, 0, true); // NaN/Inf
     }
-    let (mut s, mut e) = libm::frexp(x); // s in [0.5, 1), e int
-    s *= 2.0; // s in [1, 2)
-    e -= 1;
-    if e < min_exp {
-        s *= f64::powi(2.0, e - min_exp);
-        e = min_exp;
+    if biased_e == 0 && mant == 0 {
+        return (0, -126, false); // zero quirk
     }
-    if s == 0.0 {
-        return (0.0, -126);
+
+    // Normalize to sig at scale 2^23, exp in the "frexp/*2/-1" convention.
+    let (sig_q23, exp) = if biased_e == 0 {
+        // f32 subnormal. Find the top mantissa bit, shift up.
+        let top = 63 - (mant as u64).leading_zeros() as i32;
+        (mant << (23 - top), top - 149)
+    } else {
+        ((1i64 << 23) + mant, biased_e - 127)
+    };
+
+    // Upshift to scale 2^nfb. nfb >= 23 for all supported ISA/arch combos.
+    let shift_up = nfb - 23;
+    let mut int_sig = sig_q23 << shift_up;
+
+    let mut exp = exp;
+    if exp < min_exp {
+        // Flush: sig *= 2^(exp - min_exp), exp = min_exp. Right shift
+        // the non-negative int_sig. For the dtypes we care about, the
+        // shifted-out bits are always zero (f16/bf16/tf32 -> f32 cast
+        // leaves trailing zeros at least as wide as the max flush shift).
+        let shift = (min_exp - exp) as u32;
+        int_sig = if shift >= 64 { 0 } else { int_sig >> shift };
+        exp = min_exp;
+        if int_sig == 0 {
+            exp = -126;
+        }
     }
-    (s, e)
+
+    let signed = if sign { -int_sig } else { int_sig };
+    (signed, exp, false)
 }
 
-/// One fused dot-add step over (M, N), one output per iteration.
-/// Mirrors `fastmma/numpy_ref.py::_fused_mma_step` for f32-output paths.
+/// Signed trunc-to-zero right shift. Rust's signed `/` rounds toward zero;
+/// shifts round toward −∞. We want the former (matches `math.trunc`).
+#[inline(always)]
+fn trunc_shr(x: i64, shift: i32) -> i64 {
+    if shift <= 0 {
+        return x;
+    }
+    if shift >= 63 {
+        return 0;
+    }
+    x / (1i64 << shift)
+}
+
+/// Left-shift with guard. Used when aligning a smaller-exponent term up
+/// to the shared scale; in our kernel the shifts are always small
+/// (bounded by nfb), but the guard costs nothing and documents intent.
+#[inline(always)]
+fn guarded_shl(x: i64, shift: i32) -> i64 {
+    if shift <= 0 {
+        return x;
+    }
+    if shift >= 63 {
+        return 0;
+    }
+    x << shift
+}
+
+/// Mirrors fastmma/numpy_ref.py::_normalize_f32 — RZ to `out_mantissa_bits`,
+/// cast to f32, NaN/Inf passthrough.
+#[inline(always)]
+fn normalize_f32(result_f64: f64, out_mantissa_bits: i32) -> f32 {
+    if result_f64.is_nan() {
+        return f32::from_bits(0x7FFF_FFFF);
+    }
+    if result_f64.is_infinite() {
+        return result_f64 as f32;
+    }
+    if result_f64 == 0.0 {
+        return 0.0;
+    }
+    // Re-decompose the f64 result at f32's min_exp.
+    let (sig_int, exp, _) = decompose_f64(result_f64, F32_MIN_EXP);
+    let scale = f64::from_bits(((1023 + out_mantissa_bits) as u64) << 52); // 2^mant_bits
+    let sig_f64 = sig_int as f64 / f64::from_bits(((1023 + 23) as u64) << 52); // /2^23
+    let sig_trunc = (sig_f64 * scale).trunc() / scale;
+    (sig_f64_to_pow2_times(sig_trunc, exp)) as f32
+}
+
+#[inline(always)]
+fn decompose_f64(v: f64, min_exp: i32) -> (i64, i32, bool) {
+    // Same shape as decompose(f32) but from f64 bits, producing an int_sig
+    // at scale 2^23 (matches the f32 mantissa count we use for output).
+    let bits = v.to_bits();
+    let sign = (bits >> 63) & 1 != 0;
+    let biased_e = ((bits >> 52) & 0x7FF) as i32;
+    let mant = (bits & ((1u64 << 52) - 1)) as i128;
+
+    if biased_e == 0x7FF {
+        return (0, 0, true);
+    }
+    if biased_e == 0 && mant == 0 {
+        return (0, -126, false);
+    }
+
+    let (sig_q52, exp) = if biased_e == 0 {
+        let top = 127 - (mant as u128).leading_zeros() as i32;
+        (mant << (52 - top), top - 1074)
+    } else {
+        ((1i128 << 52) + mant, biased_e - 1023)
+    };
+
+    // Shift down to scale 2^23 (drop the low 29 bits).
+    let sig_q23 = (sig_q52 >> 29) as i64;
+    let mut int_sig = sig_q23;
+    let mut exp = exp;
+
+    if exp < min_exp {
+        let shift = (min_exp - exp) as u32;
+        int_sig = if shift >= 64 { 0 } else { int_sig >> shift };
+        exp = min_exp;
+        if int_sig == 0 {
+            exp = -126;
+        }
+    }
+
+    let signed = if sign { -int_sig } else { int_sig };
+    (signed, exp, false)
+}
+
+/// Reconstruct sig * 2^exp as f64. sig is a value in (-2, 2), exp is int.
+#[inline(always)]
+fn sig_f64_to_pow2_times(sig: f64, exp: i32) -> f64 {
+    sig * fast_pow2(exp)
+}
+
+#[inline(always)]
+fn fast_pow2(n: i32) -> f64 {
+    // 2^n via direct biased-exponent construction. Normal range only;
+    // for out-of-range the normalize path handles it via the f64 result
+    // being Inf/subnormal.
+    if n > 1023 {
+        return f64::INFINITY;
+    }
+    if n < -1022 {
+        // subnormal / underflow. Construct via scaling from smallest normal.
+        if n < -1074 {
+            return 0.0;
+        }
+        let shift = (-1022 - n) as u64;
+        return f64::from_bits(1u64 << (52 - shift));
+    }
+    f64::from_bits(((n + 1023) as u64) << 52)
+}
+
+// Max m*k, k*n, m*n across all supported tile sizes. Bump if new tiles
+// exceed this. Currently m=16, n=8, k ≤ 64 → max 512 for block-scaled
+// paths we haven't wired up yet; 256 is enough for the phase-2.1 set.
+const MAX_ELEMS: usize = 256;
+
+/// One fused dot-add, integer inner loop, f32 output. Stack-allocated
+/// decomposition buffers (sized for our tile tables).
 #[inline]
-fn fused_mma_step_f32_out(
+#[allow(clippy::too_many_arguments)]
+fn fused_mma_step_int(
     a: &[f32], // (M, K) row-major
     b: &[f32], // (K, N) row-major
     c: &[f32], // (M, N) row-major
@@ -50,90 +201,87 @@ fn fused_mma_step_f32_out(
     out_mantissa_bits: i32,
     out: &mut [f32],
 ) {
-    // Decompose all of A, B, C up front. Stored as two flat vectors each.
-    let mut a_sig = vec![0.0f64; m * k];
-    let mut a_exp = vec![0i32; m * k];
+    assert!(m * k <= MAX_ELEMS, "tile exceeds MAX_ELEMS");
+    assert!(k * n <= MAX_ELEMS, "tile exceeds MAX_ELEMS");
+
+    // Pre-decompose. (sig_i64, exp_i32) at scale 2^nfb.
+    let mut a_sig = [0i64; MAX_ELEMS];
+    let mut a_exp = [0i32; MAX_ELEMS];
+    let mut a_special = 0u64; // at most 64 A-elements with MAX_ELEMS=256? No — use bitset at byte granularity later
+    let mut a_sp = [false; MAX_ELEMS];
     for i in 0..m * k {
-        let (s, e) = extract_sig_exp(a[i] as f64, a_min_exp);
+        let (s, e, sp) = decompose(a[i], a_min_exp, nfb);
         a_sig[i] = s;
         a_exp[i] = e;
+        a_sp[i] = sp;
+        a_special |= sp as u64;
     }
-    let mut b_sig = vec![0.0f64; k * n];
-    let mut b_exp = vec![0i32; k * n];
+    let mut b_sig = [0i64; MAX_ELEMS];
+    let mut b_exp = [0i32; MAX_ELEMS];
+    let mut b_sp = [false; MAX_ELEMS];
+    let mut b_special = 0u64;
     for i in 0..k * n {
-        let (s, e) = extract_sig_exp(b[i] as f64, b_min_exp);
+        let (s, e, sp) = decompose(b[i], b_min_exp, nfb);
         b_sig[i] = s;
         b_exp[i] = e;
+        b_sp[i] = sp;
+        b_special |= sp as u64;
     }
+    let _ = (a_special, b_special); // suppress unused (folded into per-output check)
 
-    // Per-output loop. Inner k-reduction is the only hot dimension.
     for i in 0..m {
-        let a_row_sig = &a_sig[i * k..(i + 1) * k];
-        let a_row_exp = &a_exp[i * k..(i + 1) * k];
         for j in 0..n {
-            let (c_s, c_e) = extract_sig_exp(c[i * n + j] as f64, c_min_exp);
+            let (c_sig_ij, c_exp_ij, c_special) = decompose(c[i * n + j], c_min_exp, nfb);
 
-            // Collect all k+1 (sig, exp) pairs, find max exponent.
-            let mut max_e = c_e;
-            // Small stack buffers keep us out of the heap for the inner loop.
-            // k=16 for Ampere f16 (or 8 per half for split-K), so 17 entries is safe.
-            let mut sigs = [0.0f64; 128];
-            let mut exps = [0i32; 128];
-            let n_terms = k + 1;
-            debug_assert!(n_terms <= sigs.len());
-
-            sigs[0] = c_s;
-            exps[0] = c_e;
-
-            // f64 pre-check for NaN/Inf (matches oracle short-circuit).
-            // We accumulate products as plain f64 while we're walking the k
-            // axis anyway — free NaN/Inf detection at the same time.
+            // Running f64 sum for NaN/Inf detection, matches upstream.
+            let mut any_special = c_special;
             let mut fp_sum = c[i * n + j] as f64;
 
-            for l in 0..k {
-                let a_v = a[i * k + l] as f64;
-                let b_v = b[l * n + j] as f64;
-                fp_sum += a_v * b_v;
+            // Collect product (sig, exp) and track max_e.
+            let mut prod_sig = [0i64; 128];
+            let mut prod_exp = [0i32; 128];
+            let mut max_e = c_exp_ij;
 
-                let (a_s, a_e) = (a_row_sig[l], a_row_exp[l]);
-                let (b_s, b_e) = (b_sig[l * n + j], b_exp[l * n + j]);
-                let sp = a_s * b_s;
-                let ep = a_e + b_e;
-                sigs[l + 1] = sp;
-                exps[l + 1] = ep;
-                if ep > max_e {
-                    max_e = ep;
+            for l in 0..k {
+                let a_s = a_sig[i * k + l];
+                let a_e = a_exp[i * k + l];
+                let b_s = b_sig[l * n + j];
+                let b_e = b_exp[l * n + j];
+                any_special |= a_sp[i * k + l] | b_sp[l * n + j];
+
+                fp_sum += (a[i * k + l] as f64) * (b[l * n + j] as f64);
+
+                // Product int sig: i64 * i64 -> i64. For supported sizes the
+                // magnitude stays well under 2^62. f16/bf16/tf32 x f16/bf16/tf32
+                // at nfb ≤ 25: each sig ≤ 2^(nfb+1) ≤ 2^26, product ≤ 2^52.
+                let ps = a_s * b_s;
+                let pe = a_e + b_e;
+                prod_sig[l] = ps;
+                prod_exp[l] = pe;
+                if pe > max_e {
+                    max_e = pe;
                 }
             }
 
-            let result_f64 = if !fp_sum.is_finite() {
+            // Early exit for NaN/Inf.
+            let result_f64 = if any_special || !fp_sum.is_finite() {
                 fp_sum
             } else {
-                // fused_sum body
-                let scale_denom = f64::powi(2.0, nfb);
-                let mut acc = 0.0f64;
-                for idx in 0..n_terms {
-                    let shift = (nfb + exps[idx] - max_e) as i32;
-                    let scale = f64::powi(2.0, shift);
-                    let rounded = libm::trunc(sigs[idx] * scale);
-                    acc += rounded;
+                // Align and sum. All sigs are at scale 2^nfb. Products are
+                // at scale 2^(2*nfb); to align to 2^nfb at max_e:
+                //   aligned = prod_sig >> (max_e - pe + nfb)  (trunc-to-zero)
+                // C term is already at scale 2^nfb:
+                //   aligned = c_sig >> (max_e - c_exp)
+                let mut acc: i64 = trunc_shr(c_sig_ij, max_e - c_exp_ij);
+                for l in 0..k {
+                    let shift = max_e - prod_exp[l] + nfb;
+                    acc += trunc_shr(prod_sig[l], shift);
                 }
-                let sum_val = acc / scale_denom;
-                sum_val * f64::powi(2.0, max_e)
+                // Recover f64 value: acc / 2^nfb * 2^max_e = acc * 2^(max_e - nfb)
+                (acc as f64) * fast_pow2(max_e - nfb)
             };
 
-            // Output normalization: RZ to out_mantissa_bits, cast to f32.
-            let out_v: f32 = if result_f64.is_nan() {
-                f32::from_bits(0x7FFF_FFFF)
-            } else if result_f64.is_infinite() {
-                result_f64 as f32
-            } else {
-                let (mut s, e) = extract_sig_exp(result_f64, F32_MIN_EXP);
-                let scale = f64::powi(2.0, out_mantissa_bits);
-                s = libm::trunc(s * scale) / scale;
-                (s * f64::powi(2.0, e)) as f32
-            };
-            out[i * n + j] = out_v;
+            out[i * n + j] = normalize_f32(result_f64, out_mantissa_bits);
         }
     }
 }
@@ -159,40 +307,62 @@ fn mma_f32_out<'py>(
     let (_, n) = (b_v.shape()[0], b_v.shape()[1]);
     assert_eq!(k, b_v.shape()[0]);
     assert_eq!(c_v.shape(), &[m, n]);
-    assert!(k + 1 <= 128, "k too large for stack buffer");
+    assert!(k + 1 <= 128, "k too large for stack-alloc prod arrays");
 
-    // Make contiguous row-major copies. PyReadonlyArray2 gives us a view;
-    // we want flat &[f32] for tight inner loops without stride arithmetic.
-    let a_flat: Vec<f32> = a_v.iter().copied().collect();
-    let b_flat: Vec<f32> = b_v.iter().copied().collect();
-    let c_flat: Vec<f32> = c_v.iter().copied().collect();
+    // Python wrapper calls np.ascontiguousarray; as_slice() should succeed.
+    // Fall back to an owning copy if it doesn't.
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => {
+            a_owned = a_v.iter().copied().collect();
+            &a_owned
+        }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => {
+            b_owned = b_v.iter().copied().collect();
+            &b_owned
+        }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => {
+            c_owned = c_v.iter().copied().collect();
+            &c_owned
+        }
+    };
 
     let mut out = vec![0.0f32; m * n];
 
     if split_k {
         let half = k / 2;
         let mut mid = vec![0.0f32; m * n];
-        let a_half: Vec<f32> = (0..m)
-            .flat_map(|i| a_flat[i * k..i * k + half].iter().copied())
-            .collect();
-        let b_half: Vec<f32> = b_flat[..half * n].to_vec();
-        fused_mma_step_f32_out(
-            &a_half, &b_half, &c_flat, m, n, half,
+        // Split-K: A[:, :half] and A[:, half:] aren't contiguous in memory
+        // (they skip columns). Slice out contiguous halves to feed the kernel.
+        let mut a_half = [0f32; MAX_ELEMS];
+        let mut a_half2 = [0f32; MAX_ELEMS];
+        for i in 0..m {
+            a_half[i * half..(i + 1) * half]
+                .copy_from_slice(&a_slice[i * k..i * k + half]);
+            a_half2[i * half..(i + 1) * half]
+                .copy_from_slice(&a_slice[i * k + half..(i + 1) * k]);
+        }
+
+        fused_mma_step_int(
+            &a_half[..m * half], &b_slice[..half * n], &c_slice, m, n, half,
             nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, &mut mid,
         );
-
-        let a_half2: Vec<f32> = (0..m)
-            .flat_map(|i| a_flat[i * k + half..(i + 1) * k].iter().copied())
-            .collect();
-        let b_half2: Vec<f32> = b_flat[half * n..].to_vec();
-        // Second half uses `mid` in the C slot; its min_exp is f32's.
-        fused_mma_step_f32_out(
-            &a_half2, &b_half2, &mid, m, n, half,
+        fused_mma_step_int(
+            &a_half2[..m * half], &b_slice[half * n..], &mid, m, n, half,
             nfb, a_min_exp, b_min_exp, F32_MIN_EXP, out_mantissa_bits, &mut out,
         );
     } else {
-        fused_mma_step_f32_out(
-            &a_flat, &b_flat, &c_flat, m, n, k,
+        fused_mma_step_int(
+            &a_slice, &b_slice, &c_slice, m, n, k,
             nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, &mut out,
         );
     }
@@ -206,4 +376,11 @@ fn mma_f32_out<'py>(
 fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f32_out, &m)?)?;
     Ok(())
+}
+
+// Keep guarded_shl reachable for future block-scale paths and silence dead-code
+// until it's used.
+#[allow(dead_code)]
+fn _unused() {
+    let _ = guarded_shl(0, 0);
 }

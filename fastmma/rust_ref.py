@@ -177,3 +177,21 @@ class mma:
             self._out_mant_bits, self.is_split_k,
         )
         return torch.from_numpy(out)
+
+    def call_batched_simd_rayon(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        """NEON SIMD inner kernel, rayon over the batch. Combines 2.3+2.4."""
+        assert A.shape[1:] == (self.m, self.k)
+        assert B.shape[1:] == (self.k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_f32_out_batched_simd_rayon(
+            A_f32, B_f32, C_f32,
+            self.nfb, self._a_min, self._b_min, self._c_min,
+            self._out_mant_bits, self.is_split_k,
+        )
+        return torch.from_numpy(out)

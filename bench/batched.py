@@ -62,9 +62,9 @@ def main() -> None:
     import os
     print(f"batch size: {args.tiles} tiles/call, reps: {args.reps}, "
           f"cores: {os.cpu_count()}")
-    print(f"{'label':16s} {'scalar us':>10s} {'simd us':>9s} "
-          f"{'rayon us':>9s} {'simd/sc':>8s} {'rayon/sc':>9s}")
-    print("-" * 72)
+    print(f"{'label':16s} {'scalar':>8s} {'simd':>8s} {'rayon':>8s} "
+          f"{'s+r':>8s} {'simd/sc':>8s} {'ray/sc':>8s} {'s+r/sc':>8s}")
+    print("-" * 84)
 
     for fpath in sorted(FIXTURES_DIR.glob("*.pt")):
         label = fpath.stem
@@ -101,31 +101,34 @@ def main() -> None:
                 ts.append(time.perf_counter_ns() - t0)
             return statistics.median(ts) / 1000, out
 
-        us_scalar, D_scalar = _time(op.call_batched)
-        us_simd,   D_simd   = _time(op.call_batched_simd)
-        us_rayon,  D_rayon  = _time(op.call_batched_rayon)
+        us_sc, D_sc = _time(op.call_batched)
+        us_v,  D_v  = _time(op.call_batched_simd)
+        us_r,  D_r  = _time(op.call_batched_rayon)
+        us_vr, D_vr = _time(op.call_batched_simd_rayon)
 
-        per_tile_scalar = us_scalar / args.tiles
-        per_tile_simd   = us_simd   / args.tiles
-        per_tile_rayon  = us_rayon  / args.tiles
+        pt_sc = us_sc / args.tiles
+        pt_v  = us_v  / args.tiles
+        pt_r  = us_r  / args.tiles
+        pt_vr = us_vr / args.tiles
 
-        ok_s = all(_bits_equal(D_scalar[i], samples[i]["output"]) for i in range(n_check))
-        ok_v = all(_bits_equal(D_simd[i],   samples[i]["output"]) for i in range(n_check))
-        ok_r = all(_bits_equal(D_rayon[i],  samples[i]["output"]) for i in range(n_check))
-        status = "OK" if (ok_s and ok_v and ok_r) else \
-                 "FAIL:" + "".join([""  if ok_s else "s",
-                                    ""  if ok_v else "v",
-                                    ""  if ok_r else "r"])
+        ok_sc = all(_bits_equal(D_sc[i], samples[i]["output"]) for i in range(n_check))
+        ok_v  = all(_bits_equal(D_v[i],  samples[i]["output"]) for i in range(n_check))
+        ok_r  = all(_bits_equal(D_r[i],  samples[i]["output"]) for i in range(n_check))
+        ok_vr = all(_bits_equal(D_vr[i], samples[i]["output"]) for i in range(n_check))
+        status = "OK" if (ok_sc and ok_v and ok_r and ok_vr) else \
+                 "FAIL:" + "".join([""  if ok_sc else "s",
+                                    ""  if ok_v  else "v",
+                                    ""  if ok_r  else "r",
+                                    ""  if ok_vr else "V"])
 
-        simd_r  = per_tile_scalar / per_tile_simd  if per_tile_simd  > 0 else float("inf")
-        rayon_r = per_tile_scalar / per_tile_rayon if per_tile_rayon > 0 else float("inf")
-        print(f"{label:16s} {per_tile_scalar:10.3f} {per_tile_simd:9.3f} "
-              f"{per_tile_rayon:9.3f} {simd_r:6.2f}x {rayon_r:7.2f}x  {status}")
+        print(f"{label:16s} {pt_sc:8.3f} {pt_v:8.3f} {pt_r:8.3f} {pt_vr:8.3f} "
+              f"{pt_sc/pt_v:7.2f}x {pt_sc/pt_r:7.2f}x {pt_sc/pt_vr:7.2f}x  {status}")
         if status != "OK" and args.verbose:
-            for i in range(n_check):
-                if not _bits_equal(D_rayon[i], samples[i]["output"]):
-                    print(f"    rayon diff at sample {i}")
-                    break
+            for name, D in [("simd", D_v), ("rayon", D_r), ("simd+rayon", D_vr)]:
+                for i in range(n_check):
+                    if not _bits_equal(D[i], samples[i]["output"]):
+                        print(f"    {name} diff at sample {i}")
+                        break
 
 
 if __name__ == "__main__":

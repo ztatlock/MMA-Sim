@@ -815,12 +815,80 @@ fn mma_f32_out_batched_rayon<'py>(
     Ok(arr.into_pyarray_bound(py))
 }
 
+/// Phase 2.5: rayon + SIMD — parallel over the batch, NEON inner kernel.
+#[pyfunction]
+#[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, split_k))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_batched_simd_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    out_mantissa_bits: i32,
+    split_k: bool,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    assert!(m * k <= MAX_ELEMS && k * n <= MAX_ELEMS && m * n <= MAX_ELEMS);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((out_i, a_i), b_i), c_i)| {
+                run_one_tile_simd(
+                    a_i, b_i, c_i, m, n, k,
+                    nfb, a_min_exp, b_min_exp, c_min_exp,
+                    out_mantissa_bits, split_k, out_i,
+                );
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
 #[pymodule]
 fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f32_out, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched_simd, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_batched_simd_rayon, &m)?)?;
     Ok(())
 }
 

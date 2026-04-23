@@ -11,7 +11,7 @@
 //! each source dtype's min_exp; that's enough to recover bit-exact
 //! semantics.
 
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyArray3, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::prelude::*;
 
 const F32_MIN_EXP: i32 = -126;
@@ -337,12 +337,32 @@ fn mma_f32_out<'py>(
     };
 
     let mut out = vec![0.0f32; m * n];
+    run_one_tile(
+        a_slice, b_slice, c_slice, m, n, k,
+        nfb, a_min_exp, b_min_exp, c_min_exp,
+        out_mantissa_bits, split_k, &mut out,
+    );
 
+    let arr = ndarray::Array2::from_shape_vec((m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
+/// Run the kernel once for a given (a,b,c) slice into a per-tile output
+/// slot. Internal helper used by both the single-shot and batched entry
+/// points. Assumes slices are tile-sized and contiguous row-major.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile(
+    a_slice: &[f32], b_slice: &[f32], c_slice: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32, a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out_mantissa_bits: i32, split_k: bool,
+    out_slice: &mut [f32],
+) {
     if split_k {
         let half = k / 2;
-        let mut mid = vec![0.0f32; m * n];
-        // Split-K: A[:, :half] and A[:, half:] aren't contiguous in memory
-        // (they skip columns). Slice out contiguous halves to feed the kernel.
+        let mut mid = [0f32; MAX_ELEMS];
         let mut a_half = [0f32; MAX_ELEMS];
         let mut a_half2 = [0f32; MAX_ELEMS];
         for i in 0..m {
@@ -353,21 +373,85 @@ fn mma_f32_out<'py>(
         }
 
         fused_mma_step_int(
-            &a_half[..m * half], &b_slice[..half * n], &c_slice, m, n, half,
-            nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, &mut mid,
+            &a_half[..m * half], &b_slice[..half * n], c_slice, m, n, half,
+            nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits,
+            &mut mid[..m * n],
         );
         fused_mma_step_int(
-            &a_half2[..m * half], &b_slice[half * n..], &mid, m, n, half,
-            nfb, a_min_exp, b_min_exp, F32_MIN_EXP, out_mantissa_bits, &mut out,
+            &a_half2[..m * half], &b_slice[half * n..], &mid[..m * n], m, n, half,
+            nfb, a_min_exp, b_min_exp, F32_MIN_EXP, out_mantissa_bits, out_slice,
         );
     } else {
         fused_mma_step_int(
-            &a_slice, &b_slice, &c_slice, m, n, k,
-            nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, &mut out,
+            a_slice, b_slice, c_slice, m, n, k,
+            nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, out_slice,
+        );
+    }
+}
+
+/// Batched entry: run B independent MMAs in a single call. Amortizes the
+/// per-call Python/FFI overhead across the batch. Inputs are 3-D:
+///   a: (B, M, K), b: (B, K, N), c: (B, M, N). Output: (B, M, N).
+#[pyfunction]
+#[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, split_k))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_batched<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    out_mantissa_bits: i32,
+    split_k: bool,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    assert!(m * k <= MAX_ELEMS && k * n <= MAX_ELEMS && m * n <= MAX_ELEMS);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    for bi in 0..batch {
+        let a_i = &a_slice[bi * a_stride..(bi + 1) * a_stride];
+        let b_i = &b_slice[bi * b_stride..(bi + 1) * b_stride];
+        let c_i = &c_slice[bi * c_stride..(bi + 1) * c_stride];
+        let out_i = &mut out[bi * c_stride..(bi + 1) * c_stride];
+        run_one_tile(
+            a_i, b_i, c_i, m, n, k,
+            nfb, a_min_exp, b_min_exp, c_min_exp,
+            out_mantissa_bits, split_k, out_i,
         );
     }
 
-    let arr = ndarray::Array2::from_shape_vec((m, n), out)
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(arr.into_pyarray_bound(py))
 }
@@ -375,6 +459,7 @@ fn mma_f32_out<'py>(
 #[pymodule]
 fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f32_out, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_batched, &m)?)?;
     Ok(())
 }
 

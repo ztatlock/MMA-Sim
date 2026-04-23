@@ -93,41 +93,64 @@ class mma:
         )
         return torch.from_numpy(out)
 
+    def _prep_batched(self, A, B, C):
+        A_f32 = np.ascontiguousarray(
+            A.detach().cpu().to(torch.float32).contiguous().numpy(),
+            dtype=np.float32,
+        )
+        B_f32 = np.ascontiguousarray(
+            B.detach().cpu().to(torch.float32).contiguous().numpy(),
+            dtype=np.float32,
+        )
+        C_f32 = np.ascontiguousarray(
+            C.detach().cpu().to(torch.float32).contiguous().numpy(),
+            dtype=np.float32,
+        )
+        if self.a_type is torch.float32:  # tf32
+            A_f32 = np.ascontiguousarray(
+                ((A_f32.view(np.int32) >> 13) << 13).view(np.float32)
+            )
+            B_f32 = np.ascontiguousarray(
+                ((B_f32.view(np.int32) >> 13) << 13).view(np.float32)
+            )
+        return A_f32, B_f32, C_f32
+
     def call_batched(
         self,
         A: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched variant: A, B, C are 3-D with a leading batch dim.
+        """Scalar batched call. (B, M, K) / (B, K, N) / (B, M, N) -> (B, M, N)."""
+        assert A.shape[1:] == (self.m, self.k)
+        assert B.shape[1:] == (self.k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_f32_out_batched(
+            A_f32, B_f32, C_f32,
+            self.nfb, self._a_min, self._b_min, self._c_min,
+            self._out_mant_bits, self.is_split_k,
+        )
+        return torch.from_numpy(out)
 
-        Shapes: A=(batch, m, k), B=(batch, k, n), C=(batch, m, n).
-        Returns: (batch, m, n). Semantics are identical to calling `self`
-        once per batch index; this just amortizes the PyO3 boundary.
+    def call_batched_simd(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        """SIMD batched call (aarch64 NEON; scalar fallback elsewhere).
+
+        Same semantics as call_batched — bit-exact. Vectorized 2-wide
+        on the j-axis inside the kernel.
         """
         assert A.shape[1:] == (self.m, self.k)
         assert B.shape[1:] == (self.k, self.n)
         assert C.shape[1:] == (self.m, self.n)
-        A_f32 = A.detach().cpu().to(torch.float32).contiguous().numpy()
-        B_f32 = B.detach().cpu().to(torch.float32).contiguous().numpy()
-        C_f32 = C.detach().cpu().to(torch.float32).contiguous().numpy()
-        A_f32 = np.ascontiguousarray(A_f32, dtype=np.float32)
-        B_f32 = np.ascontiguousarray(B_f32, dtype=np.float32)
-        C_f32 = np.ascontiguousarray(C_f32, dtype=np.float32)
-
-        if self.a_type is torch.float32:  # tf32
-            raw_a = A_f32.view(np.int32)
-            raw_b = B_f32.view(np.int32)
-            A_f32 = ((raw_a >> 13) << 13).view(np.float32)
-            B_f32 = ((raw_b >> 13) << 13).view(np.float32)
-            A_f32 = np.ascontiguousarray(A_f32)
-            B_f32 = np.ascontiguousarray(B_f32)
-
-        out = _rs.mma_f32_out_batched(
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_f32_out_batched_simd(
             A_f32, B_f32, C_f32,
-            self.nfb,
-            self._a_min, self._b_min, self._c_min,
-            self._out_mant_bits,
-            self.is_split_k,
+            self.nfb, self._a_min, self._b_min, self._c_min,
+            self._out_mant_bits, self.is_split_k,
         )
         return torch.from_numpy(out)

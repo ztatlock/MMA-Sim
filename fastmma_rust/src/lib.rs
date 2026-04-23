@@ -456,10 +456,291 @@ fn mma_f32_out_batched<'py>(
     Ok(arr.into_pyarray_bound(py))
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// SIMD variant (aarch64 NEON, 2-wide on the j-axis).
+//
+// Phase 2.3: vectorize the per-output align+accumulate across two
+// adjacent output columns (j, j+1). Scalar bookkeeping (pre-decomposes,
+// max_e scan, product collection) stays scalar; the k+1-term reduction
+// becomes i64x2 add with a vectorized trunc-toward-zero right shift.
+//
+// On non-aarch64 builds, `mma_f32_out_batched_simd` falls back to the
+// scalar kernel so the Python side can still import the function name.
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::*;
+
+    /// Vectorized trunc-toward-zero right shift: for each lane,
+    ///   result_i = sig_i / 2^shift_i  rounded toward zero.
+    /// Requires 0 ≤ shift_i ≤ 63. Arithmetic right shift of an
+    /// non-negative magnitude is equivalent to the desired trunc.
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) unsafe fn trunc_shr_v(sig: int64x2_t, shift: int64x2_t) -> int64x2_t {
+        // sign_mask: 0 for positives, all-ones for negatives.
+        let sign_mask = vshrq_n_s64(sig, 63);
+        // abs = (sig XOR sign_mask) - sign_mask
+        let abs_sig = vsubq_s64(veorq_s64(sig, sign_mask), sign_mask);
+        // vshlq with negative count = arith right shift; abs is ≥ 0 so
+        // arithmetic vs logical is the same.
+        let shifted = vshlq_s64(abs_sig, vnegq_s64(shift));
+        // Reapply sign.
+        vsubq_s64(veorq_s64(shifted, sign_mask), sign_mask)
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) unsafe fn pack2_s64(lo: i64, hi: i64) -> int64x2_t {
+        let arr = [lo, hi];
+        vld1q_s64(arr.as_ptr())
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub(super) unsafe fn unpack2_s64(v: int64x2_t) -> (i64, i64) {
+        (vgetq_lane_s64::<0>(v), vgetq_lane_s64::<1>(v))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_mma_step_int_neon(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out_mantissa_bits: i32,
+    out: &mut [f32],
+) {
+    assert!(n % 2 == 0, "NEON path requires even n");
+    assert!(m * k <= MAX_ELEMS);
+    assert!(k * n <= MAX_ELEMS);
+
+    let mut a_sig = [0i64; MAX_ELEMS];
+    let mut a_exp = [0i32; MAX_ELEMS];
+    let mut a_sp = [false; MAX_ELEMS];
+    for i in 0..m * k {
+        let (s, e, sp) = decompose(a[i], a_min_exp, nfb);
+        a_sig[i] = s;
+        a_exp[i] = e;
+        a_sp[i] = sp;
+    }
+    let mut b_sig = [0i64; MAX_ELEMS];
+    let mut b_exp = [0i32; MAX_ELEMS];
+    let mut b_sp = [false; MAX_ELEMS];
+    for i in 0..k * n {
+        let (s, e, sp) = decompose(b[i], b_min_exp, nfb);
+        b_sig[i] = s;
+        b_exp[i] = e;
+        b_sp[i] = sp;
+    }
+
+    for i in 0..m {
+        let mut jp = 0;
+        while jp + 1 < n {
+            let (c0_sig, c0_exp, c0_sp) = decompose(c[i * n + jp], c_min_exp, nfb);
+            let (c1_sig, c1_exp, c1_sp) = decompose(c[i * n + jp + 1], c_min_exp, nfb);
+
+            let mut any_special = c0_sp | c1_sp;
+            let mut fp0 = c[i * n + jp] as f64;
+            let mut fp1 = c[i * n + jp + 1] as f64;
+
+            // Stack buffers for per-output products; k ≤ 128 in practice.
+            let mut ps0 = [0i64; 128];
+            let mut ps1 = [0i64; 128];
+            let mut pe0 = [0i32; 128];
+            let mut pe1 = [0i32; 128];
+            let mut max_e0 = c0_exp;
+            let mut max_e1 = c1_exp;
+
+            for l in 0..k {
+                let a_s = a_sig[i * k + l];
+                let a_e = a_exp[i * k + l];
+                let b0_s = b_sig[l * n + jp];
+                let b1_s = b_sig[l * n + jp + 1];
+                let b0_e = b_exp[l * n + jp];
+                let b1_e = b_exp[l * n + jp + 1];
+                any_special |= a_sp[i * k + l] | b_sp[l * n + jp] | b_sp[l * n + jp + 1];
+
+                fp0 += (a[i * k + l] as f64) * (b[l * n + jp] as f64);
+                fp1 += (a[i * k + l] as f64) * (b[l * n + jp + 1] as f64);
+
+                ps0[l] = a_s * b0_s;
+                ps1[l] = a_s * b1_s;
+                let pe0l = a_e + b0_e;
+                let pe1l = a_e + b1_e;
+                pe0[l] = pe0l;
+                pe1[l] = pe1l;
+                if pe0l > max_e0 { max_e0 = pe0l; }
+                if pe1l > max_e1 { max_e1 = pe1l; }
+            }
+
+            let (r0, r1) = if any_special || !fp0.is_finite() || !fp1.is_finite() {
+                (fp0, fp1)
+            } else {
+                // Start with C term aligned.
+                let c_sig_v = neon::pack2_s64(c0_sig, c1_sig);
+                let c_shift_v = neon::pack2_s64(
+                    (max_e0 - c0_exp) as i64,
+                    (max_e1 - c1_exp) as i64,
+                );
+                let mut acc_v = neon::trunc_shr_v(c_sig_v, c_shift_v);
+
+                for l in 0..k {
+                    let sig_v = neon::pack2_s64(ps0[l], ps1[l]);
+                    let shift_v = neon::pack2_s64(
+                        (max_e0 - pe0[l] + nfb) as i64,
+                        (max_e1 - pe1[l] + nfb) as i64,
+                    );
+                    acc_v = core::arch::aarch64::vaddq_s64(acc_v, neon::trunc_shr_v(sig_v, shift_v));
+                }
+
+                let (acc0, acc1) = neon::unpack2_s64(acc_v);
+                (
+                    (acc0 as f64) * fast_pow2(max_e0 - nfb),
+                    (acc1 as f64) * fast_pow2(max_e1 - nfb),
+                )
+            };
+
+            out[i * n + jp] = normalize_f32(r0, out_mantissa_bits);
+            out[i * n + jp + 1] = normalize_f32(r1, out_mantissa_bits);
+            jp += 2;
+        }
+        // n is always even for supported tiles (max n = 8); unreachable tail.
+        debug_assert_eq!(jp, n);
+    }
+}
+
+/// Per-tile dispatch to the NEON kernel (or scalar on non-aarch64).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_simd(
+    a_slice: &[f32], b_slice: &[f32], c_slice: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32, a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out_mantissa_bits: i32, split_k: bool,
+    out_slice: &mut [f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if n % 2 == 0 {
+            unsafe {
+                if split_k {
+                    let half = k / 2;
+                    let mut mid = [0f32; MAX_ELEMS];
+                    let mut a_half = [0f32; MAX_ELEMS];
+                    let mut a_half2 = [0f32; MAX_ELEMS];
+                    for i in 0..m {
+                        a_half[i * half..(i + 1) * half]
+                            .copy_from_slice(&a_slice[i * k..i * k + half]);
+                        a_half2[i * half..(i + 1) * half]
+                            .copy_from_slice(&a_slice[i * k + half..(i + 1) * k]);
+                    }
+                    fused_mma_step_int_neon(
+                        &a_half[..m * half], &b_slice[..half * n], c_slice,
+                        m, n, half,
+                        nfb, a_min_exp, b_min_exp, c_min_exp,
+                        out_mantissa_bits,
+                        &mut mid[..m * n],
+                    );
+                    fused_mma_step_int_neon(
+                        &a_half2[..m * half], &b_slice[half * n..], &mid[..m * n],
+                        m, n, half,
+                        nfb, a_min_exp, b_min_exp, F32_MIN_EXP,
+                        out_mantissa_bits,
+                        out_slice,
+                    );
+                } else {
+                    fused_mma_step_int_neon(
+                        a_slice, b_slice, c_slice, m, n, k,
+                        nfb, a_min_exp, b_min_exp, c_min_exp,
+                        out_mantissa_bits, out_slice,
+                    );
+                }
+            }
+            return;
+        }
+    }
+    // Fallback: scalar.
+    run_one_tile(
+        a_slice, b_slice, c_slice, m, n, k,
+        nfb, a_min_exp, b_min_exp, c_min_exp,
+        out_mantissa_bits, split_k, out_slice,
+    );
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, split_k))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_batched_simd<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    out_mantissa_bits: i32,
+    split_k: bool,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    assert!(m * k <= MAX_ELEMS && k * n <= MAX_ELEMS && m * n <= MAX_ELEMS);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    for bi in 0..batch {
+        let a_i = &a_slice[bi * a_stride..(bi + 1) * a_stride];
+        let b_i = &b_slice[bi * b_stride..(bi + 1) * b_stride];
+        let c_i = &c_slice[bi * c_stride..(bi + 1) * c_stride];
+        let out_i = &mut out[bi * c_stride..(bi + 1) * c_stride];
+        run_one_tile_simd(
+            a_i, b_i, c_i, m, n, k,
+            nfb, a_min_exp, b_min_exp, c_min_exp,
+            out_mantissa_bits, split_k, out_i,
+        );
+    }
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
 #[pymodule]
 fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f32_out, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_batched_simd, &m)?)?;
     Ok(())
 }
 

@@ -154,3 +154,26 @@ class mma:
             self._out_mant_bits, self.is_split_k,
         )
         return torch.from_numpy(out)
+
+    def call_batched_rayon(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scalar kernel, rayon-parallelized across the batch dim.
+
+        Same scalar inner kernel as call_batched (no SIMD). This is
+        the pre-SIMD baseline with threading layered on top, so the
+        speedup vs call_batched is attributable to parallelism alone.
+        """
+        assert A.shape[1:] == (self.m, self.k)
+        assert B.shape[1:] == (self.k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_f32_out_batched_rayon(
+            A_f32, B_f32, C_f32,
+            self.nfb, self._a_min, self._b_min, self._c_min,
+            self._out_mant_bits, self.is_split_k,
+        )
+        return torch.from_numpy(out)

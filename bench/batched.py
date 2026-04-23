@@ -59,10 +59,12 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    print(f"batch size: {args.tiles} tiles/call, reps: {args.reps}")
-    print(f"{'label':18s} {'single us':>10s} {'per-tile scalar':>17s} "
-          f"{'per-tile simd':>15s} {'simd/scalar':>12s}")
-    print("-" * 80)
+    import os
+    print(f"batch size: {args.tiles} tiles/call, reps: {args.reps}, "
+          f"cores: {os.cpu_count()}")
+    print(f"{'label':16s} {'scalar us':>10s} {'simd us':>9s} "
+          f"{'rayon us':>9s} {'simd/sc':>8s} {'rayon/sc':>9s}")
+    print("-" * 72)
 
     for fpath in sorted(FIXTURES_DIR.glob("*.pt")):
         label = fpath.stem
@@ -99,24 +101,30 @@ def main() -> None:
                 ts.append(time.perf_counter_ns() - t0)
             return statistics.median(ts) / 1000, out
 
-        batched_scalar_us, D_scalar = _time(op.call_batched)
-        batched_simd_us, D_simd = _time(op.call_batched_simd)
+        us_scalar, D_scalar = _time(op.call_batched)
+        us_simd,   D_simd   = _time(op.call_batched_simd)
+        us_rayon,  D_rayon  = _time(op.call_batched_rayon)
 
-        per_tile_scalar = batched_scalar_us / args.tiles
-        per_tile_simd = batched_simd_us / args.tiles
+        per_tile_scalar = us_scalar / args.tiles
+        per_tile_simd   = us_simd   / args.tiles
+        per_tile_rayon  = us_rayon  / args.tiles
 
-        ok_scalar = all(_bits_equal(D_scalar[i], samples[i]["output"]) for i in range(n_check))
-        ok_simd = all(_bits_equal(D_simd[i], samples[i]["output"]) for i in range(n_check))
-        status = ("OK" if ok_scalar else "FAIL-scalar") if ok_scalar and ok_simd \
-            else "FAIL-simd" if ok_scalar else "FAIL-both"
+        ok_s = all(_bits_equal(D_scalar[i], samples[i]["output"]) for i in range(n_check))
+        ok_v = all(_bits_equal(D_simd[i],   samples[i]["output"]) for i in range(n_check))
+        ok_r = all(_bits_equal(D_rayon[i],  samples[i]["output"]) for i in range(n_check))
+        status = "OK" if (ok_s and ok_v and ok_r) else \
+                 "FAIL:" + "".join([""  if ok_s else "s",
+                                    ""  if ok_v else "v",
+                                    ""  if ok_r else "r"])
 
-        simd_ratio = per_tile_scalar / per_tile_simd if per_tile_simd > 0 else float("inf")
-        print(f"{label:18s} {single_us:10.2f} {per_tile_scalar:17.3f} "
-              f"{per_tile_simd:15.3f} {simd_ratio:10.2f}x  {status}")
-        if (not ok_scalar or not ok_simd) and args.verbose:
+        simd_r  = per_tile_scalar / per_tile_simd  if per_tile_simd  > 0 else float("inf")
+        rayon_r = per_tile_scalar / per_tile_rayon if per_tile_rayon > 0 else float("inf")
+        print(f"{label:16s} {per_tile_scalar:10.3f} {per_tile_simd:9.3f} "
+              f"{per_tile_rayon:9.3f} {simd_r:6.2f}x {rayon_r:7.2f}x  {status}")
+        if status != "OK" and args.verbose:
             for i in range(n_check):
-                if not _bits_equal(D_simd[i], samples[i]["output"]):
-                    print(f"    simd diff at sample {i}")
+                if not _bits_equal(D_rayon[i], samples[i]["output"]):
+                    print(f"    rayon diff at sample {i}")
                     break
 
 

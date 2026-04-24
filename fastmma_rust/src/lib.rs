@@ -1329,9 +1329,200 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_turing_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
     #[cfg(target_os = "macos")]
     m.add_function(wrap_pyfunction!(mma_metal_ampere_f16, &m)?)?;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M1c — Block-scaled mxfp8 (k=32, per-tile scalar scales).
+//
+// Oracle [nv_ptx.py:122-131] dispatches to nv_fused_dot_add with
+// scale_A[i, 0] and scale_B[0, j] applied per output. For ue8m0 scales
+// (pure powers of 2) only the exponent is needed — sig is always 1.
+// We pre-extract exponents row-by-row / col-by-col on the Python side
+// and pass as i32 tables; the kernel adds them to each product's exp.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Extract an ue8m0 scale's unbiased exponent from its f32 cast.
+/// For ue8m0: v = 2^(raw - 127), so biased_e - 127 = raw - 127.
+/// For general power-of-2 scales this returns the exponent directly.
+#[inline(always)]
+fn extract_pow2_exp(v: f32) -> i32 {
+    let bits = v.to_bits();
+    let biased_e = ((bits >> 23) & 0xFF) as i32;
+    biased_e - 127
+}
+
+// Large stack buffer for block-scaled tiles (k can be 32 or 64).
+// m*k = 16*64 = 1024; k*n = 64*8 = 512.
+const BS_MAX: usize = 1024;
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_block_scale_k32(
+    a: &[f32], b: &[f32], c: &[f32],
+    scale_a_exp: &[i32], // length m
+    scale_b_exp: &[i32], // length n
+    m: usize, n: usize, k: usize,
+    nfb: i32,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out_mantissa_bits: i32,
+    out: &mut [f32],
+) {
+    assert!(m * k <= BS_MAX);
+    assert!(k * n <= BS_MAX);
+
+    let mut a_sig = [0i64; BS_MAX];
+    let mut a_exp = [0i32; BS_MAX];
+    let mut a_sp = [false; BS_MAX];
+    for i in 0..m * k {
+        let (s, e, sp) = decompose(a[i], a_min_exp, nfb);
+        a_sig[i] = s;
+        a_exp[i] = e;
+        a_sp[i] = sp;
+    }
+    let mut b_sig = [0i64; BS_MAX];
+    let mut b_exp = [0i32; BS_MAX];
+    let mut b_sp = [false; BS_MAX];
+    for i in 0..k * n {
+        let (s, e, sp) = decompose(b[i], b_min_exp, nfb);
+        b_sig[i] = s;
+        b_exp[i] = e;
+        b_sp[i] = sp;
+    }
+
+    for i in 0..m {
+        for j in 0..n {
+            let (c_sig_ij, c_exp_ij, c_special) = decompose(c[i * n + j], c_min_exp, nfb);
+            let mut any_special = c_special;
+            let mut fp_sum = c[i * n + j] as f64;
+
+            // Per-output scale exp offset applied to every product's exp.
+            let scale_exp_sum = scale_a_exp[i] + scale_b_exp[j];
+            let scale_f64 = fast_pow2(scale_exp_sum);
+            // fp_sum needs the scale applied for the NaN/Inf pre-check:
+            // products_f64 * scale_a * scale_b summed. Power-of-2 scale:
+            // multiply each a*b by 2^(scale_exp_sum).
+
+            let mut prod_sig = [0i64; 128];
+            let mut prod_exp = [0i32; 128];
+            let mut max_e = c_exp_ij;
+            assert!(k <= 128);
+
+            for l in 0..k {
+                let a_s = a_sig[i * k + l];
+                let a_e = a_exp[i * k + l];
+                let b_s = b_sig[l * n + j];
+                let b_e = b_exp[l * n + j];
+                any_special |= a_sp[i * k + l] | b_sp[l * n + j];
+
+                fp_sum += (a[i * k + l] as f64) * (b[l * n + j] as f64) * scale_f64;
+
+                let ps = a_s * b_s;
+                let pe = a_e + b_e + scale_exp_sum;
+                prod_sig[l] = ps;
+                prod_exp[l] = pe;
+                if pe > max_e {
+                    max_e = pe;
+                }
+            }
+
+            let result_f64 = if any_special || !fp_sum.is_finite() {
+                fp_sum
+            } else {
+                let mut acc: i64 = trunc_shr(c_sig_ij, max_e - c_exp_ij);
+                for l in 0..k {
+                    let shift = max_e - prod_exp[l] + nfb;
+                    acc += trunc_shr(prod_sig[l], shift);
+                }
+                (acc as f64) * fast_pow2(max_e - nfb)
+            };
+
+            out[i * n + j] = normalize_f32(result_f64, out_mantissa_bits);
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, scale_a, scale_b, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_block_scale_k32_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,  // (batch, m, k)
+    b: PyReadonlyArray3<'py, f32>,  // (batch, k, n)
+    c: PyReadonlyArray3<'py, f32>,  // (batch, m, n)
+    scale_a: PyReadonlyArray3<'py, f32>, // (batch, m, 1)
+    scale_b: PyReadonlyArray3<'py, f32>, // (batch, 1, n)
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    out_mantissa_bits: i32,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let sa_v = scale_a.as_array();
+    let sb_v = scale_b.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    assert_eq!(sa_v.shape(), &[batch, m, 1]);
+    assert_eq!(sb_v.shape(), &[batch, 1, n]);
+
+    // Pre-extract scale exponents into per-batch tables.
+    let sa_flat: Vec<f32> = sa_v.iter().copied().collect();
+    let sb_flat: Vec<f32> = sb_v.iter().copied().collect();
+    let scale_a_exp: Vec<i32> = sa_flat.iter().map(|&v| extract_pow2_exp(v)).collect();
+    let scale_b_exp: Vec<i32> = sb_flat.iter().map(|&v| extract_pow2_exp(v)).collect();
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        (0..batch).into_par_iter()
+            .zip(out.par_chunks_mut(c_stride))
+            .for_each(|(bi, out_i)| {
+                let a_i = &a_slice[bi * a_stride..(bi + 1) * a_stride];
+                let b_i = &b_slice[bi * b_stride..(bi + 1) * b_stride];
+                let c_i = &c_slice[bi * c_stride..(bi + 1) * c_stride];
+                let sa_i = &scale_a_exp[bi * m..(bi + 1) * m];
+                let sb_i = &scale_b_exp[bi * n..(bi + 1) * n];
+                run_one_tile_block_scale_k32(
+                    a_i, b_i, c_i, sa_i, sb_i,
+                    m, n, k,
+                    nfb, a_min_exp, b_min_exp, c_min_exp,
+                    out_mantissa_bits, out_i,
+                );
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
 }
 
 // ─────────────────────────────────────────────────────────────────────

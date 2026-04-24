@@ -53,6 +53,16 @@ _MIN_EXP = {
 }
 
 
+_SUPPORTED_BLOCK_SCALE: set[tuple[str, str]] = {
+    # RTX Blackwell mxf8f6f4 (k=32, per-tile ue8m0 scale). Phase M1c.
+    ("RTX Blackwell", "m16n8k32.block32.f32.e5m2.e5m2.f32.ue8m0"),
+    ("RTX Blackwell", "m16n8k32.block32.f32.e5m2.e4m3.f32.ue8m0"),
+    ("RTX Blackwell", "m16n8k32.block32.f32.e4m3.e5m2.f32.ue8m0"),
+    ("RTX Blackwell", "m16n8k32.block32.f32.e4m3.e4m3.f32.ue8m0"),
+    # mxfp4 (k=64) and ue4m3 scale variants come later (M1d).
+}
+
+
 class mma:
     def __init__(self, arch: str, qualifier: str):
         from mmasim.simulator.nv_ptx import mma as _oracle_mma
@@ -234,6 +244,11 @@ class mma:
         ("Volta",  "m8n8k4.f32.f16.f16.f32"):     "mma_spec_volta_f16",
     }
 
+    # ─────────────────────────────────────────────────────────────────
+    # end of `mma` class methods — see `mma_block_scale` below for the
+    # block-scaled variants.
+    # ─────────────────────────────────────────────────────────────────
+
     def call_batched_metal(
         self,
         A: torch.Tensor,
@@ -274,4 +289,95 @@ class mma:
         assert C.shape[1:] == (self.m, self.n)
         A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
         out = getattr(_rs, fn_name)(A_f32, B_f32, C_f32)
+        return torch.from_numpy(out)
+
+
+class mma_block_scale:
+    """Rust-backed block-scaled MMA (RTX Blackwell mxf8f6f4 / mxf4nvf4).
+
+    Currently supports: k=32 mxf8f6f4 with ue8m0 (power-of-2) scales.
+    Other variants (k=64 mxfp4, ue4m3 scales) raise NotImplementedError.
+    """
+
+    def __init__(self, arch: str, qualifier: str):
+        from mmasim.simulator.nv_ptx import mma_block_scale as _oracle_mbs
+        _ref = _oracle_mbs(arch, qualifier)
+        self.arch = arch
+        self.qualifier = qualifier
+        self.m, self.n, self.k = _ref.m, _ref.n, _ref.k
+        self.block_size = _ref.block_size
+        self.packing = _ref.packing
+        self.a_type = _ref.a_type
+        self.b_type = _ref.b_type
+        self.c_type = _ref.c_type
+        self.d_type = _ref.d_type
+        self.s_type = _ref.s_type
+        self.nfb = _ref.n_accum_fractional_bits
+        self.output_type = _ref.output_type
+
+        if (arch, qualifier) not in _SUPPORTED_BLOCK_SCALE:
+            raise NotImplementedError(
+                f"rust_ref.mma_block_scale: not yet supported: "
+                f"({arch!r}, {qualifier!r})"
+            )
+
+        self._out_mant_bits = 13 if self.output_type == "f32_e8m13" else 23
+        self._a_min = _MIN_EXP[self.a_type]
+        self._b_min = _MIN_EXP[self.b_type]
+        self._c_min = _MIN_EXP[self.c_type]
+
+    @staticmethod
+    def _as_f32(t: torch.Tensor) -> np.ndarray:
+        return np.ascontiguousarray(
+            t.detach().cpu().to(torch.float32).contiguous().numpy(),
+            dtype=np.float32,
+        )
+
+    def __call__(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        scale_A: torch.Tensor,
+        scale_B: torch.Tensor,
+    ) -> torch.Tensor:
+        # Non-batched: wrap with batch=1 and route through the batched
+        # kernel. We lose a small amount of overhead but it's fine for
+        # the single-call (bench.validate) path.
+        out = self.call_batched(
+            A.unsqueeze(0), B.unsqueeze(0), C.unsqueeze(0),
+            scale_A.unsqueeze(0), scale_B.unsqueeze(0),
+        )
+        return out[0]
+
+    def call_batched(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        scale_A: torch.Tensor,
+        scale_B: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched: A=(B, m, k), B=(B, k, n), C=(B, m, n),
+        scale_A=(B, m, k/block_size), scale_B=(B, k/block_size, n)."""
+        # For k=32, scale_A shape is (B, m, 1) and scale_B is (B, 1, n).
+        assert self.k == 32, "only k=32 supported in M1c"
+        assert A.shape[1:] == (self.m, self.k)
+        assert B.shape[1:] == (self.k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
+        assert scale_A.shape[1:] == (self.m, 1)
+        assert scale_B.shape[1:] == (1, self.n)
+
+        A_f32 = self._as_f32(A)
+        B_f32 = self._as_f32(B)
+        C_f32 = self._as_f32(C)
+        sA_f32 = self._as_f32(scale_A)
+        sB_f32 = self._as_f32(scale_B)
+
+        out = _rs.mma_f32_out_block_scale_k32_rayon(
+            A_f32, B_f32, C_f32, sA_f32, sB_f32,
+            self.nfb,
+            self._a_min, self._b_min, self._c_min,
+            self._out_mant_bits,
+        )
         return torch.from_numpy(out)

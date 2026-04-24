@@ -195,3 +195,25 @@ class mma:
             self._out_mant_bits, self.is_split_k,
         )
         return torch.from_numpy(out)
+
+    def call_batched_specialized(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase 3.0 hand-specialized kernel. Currently only
+        (Ampere, m16n8k16.f32.f16.f16.f32). Raises NotImplementedError
+        otherwise — used purely for ceiling measurement on the workhorse."""
+        if (self.arch, self.qualifier) != (
+            "Ampere", "m16n8k16.f32.f16.f16.f32"
+        ):
+            raise NotImplementedError(
+                "specialized kernel only supports Ampere m16n8k16.f32.f16.f16.f32"
+            )
+        assert A.shape[1:] == (16, 16)
+        assert B.shape[1:] == (16, 8)
+        assert C.shape[1:] == (16, 8)
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_ampere_f16_f32_batched_specialized(A_f32, B_f32, C_f32)
+        return torch.from_numpy(out)

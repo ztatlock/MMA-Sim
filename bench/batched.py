@@ -63,8 +63,8 @@ def main() -> None:
     print(f"batch size: {args.tiles} tiles/call, reps: {args.reps}, "
           f"cores: {os.cpu_count()}")
     print(f"{'label':16s} {'scalar':>8s} {'simd':>8s} {'rayon':>8s} "
-          f"{'s+r':>8s} {'simd/sc':>8s} {'ray/sc':>8s} {'s+r/sc':>8s}")
-    print("-" * 84)
+          f"{'s+r':>8s} {'spec':>8s} {'s+r/sc':>8s} {'spec/s+r':>9s}")
+    print("-" * 82)
 
     for fpath in sorted(FIXTURES_DIR.glob("*.pt")):
         label = fpath.stem
@@ -111,18 +111,34 @@ def main() -> None:
         pt_r  = us_r  / args.tiles
         pt_vr = us_vr / args.tiles
 
+        # Specialized kernel is ampere-f16 only (Phase 3.0 ceiling probe).
+        has_spec = False
+        pt_sp = 0.0
+        ok_sp = True
+        try:
+            us_sp, D_sp = _time(op.call_batched_specialized)
+            pt_sp = us_sp / args.tiles
+            ok_sp = all(_bits_equal(D_sp[i], samples[i]["output"]) for i in range(n_check))
+            has_spec = True
+        except NotImplementedError:
+            pass
+
         ok_sc = all(_bits_equal(D_sc[i], samples[i]["output"]) for i in range(n_check))
         ok_v  = all(_bits_equal(D_v[i],  samples[i]["output"]) for i in range(n_check))
         ok_r  = all(_bits_equal(D_r[i],  samples[i]["output"]) for i in range(n_check))
         ok_vr = all(_bits_equal(D_vr[i], samples[i]["output"]) for i in range(n_check))
-        status = "OK" if (ok_sc and ok_v and ok_r and ok_vr) else \
+        all_ok = ok_sc and ok_v and ok_r and ok_vr and ok_sp
+        status = "OK" if all_ok else \
                  "FAIL:" + "".join([""  if ok_sc else "s",
                                     ""  if ok_v  else "v",
                                     ""  if ok_r  else "r",
-                                    ""  if ok_vr else "V"])
+                                    ""  if ok_vr else "V",
+                                    ""  if ok_sp else "S"])
 
+        spec_str  = f"{pt_sp:8.3f}" if has_spec else f"{'—':>8s}"
+        ratio_str = f"{pt_vr/pt_sp:8.2f}x" if has_spec else f"{'—':>9s}"
         print(f"{label:16s} {pt_sc:8.3f} {pt_v:8.3f} {pt_r:8.3f} {pt_vr:8.3f} "
-              f"{pt_sc/pt_v:7.2f}x {pt_sc/pt_r:7.2f}x {pt_sc/pt_vr:7.2f}x  {status}")
+              f"{spec_str} {pt_sc/pt_vr:7.2f}x {ratio_str}  {status}")
         if status != "OK" and args.verbose:
             for name, D in [("simd", D_v), ("rayon", D_r), ("simd+rayon", D_vr)]:
                 for i in range(n_check):

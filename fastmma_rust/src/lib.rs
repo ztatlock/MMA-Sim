@@ -46,9 +46,21 @@ fn decompose(v: f32, min_exp: i32, nfb: i32) -> (i64, i32, bool) {
         ((1i64 << 23) + mant, biased_e - 127)
     };
 
-    // Upshift to scale 2^nfb. nfb >= 23 for all supported ISA/arch combos.
+    // Shift to scale 2^nfb. For Ada-fp8 we have nfb=13 < 23, so this may
+    // be a right-shift (intentional precision loss to nfb bits of sig;
+    // matches the oracle's `trunc(sig * 2^nfb)` path).
     let shift_up = nfb - 23;
-    let mut int_sig = sig_q23 << shift_up;
+    let mut int_sig = if shift_up >= 0 {
+        sig_q23 << shift_up
+    } else {
+        // Right-shift on a non-negative magnitude is lossless for f8
+        // inputs (mantissa has ≤ 3 bits, so the bottom 20+ bits of
+        // sig_q23 are zero). For f32 C under nfb=13, this truncates sig
+        // to 13 bits — which is what the oracle does at max_e-aligned
+        // products anyway. Trunc-toward-zero is achieved via sign
+        // applied *after* this shift.
+        sig_q23 >> (-shift_up)
+    };
 
     let mut exp = exp;
     if exp < min_exp {

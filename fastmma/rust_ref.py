@@ -16,13 +16,24 @@ import torch
 import fastmma_rust as _rs  # compiled Rust extension
 
 
-# (arch, qualifier) -> nothing (kernel reads params off the oracle object)
+# (arch, qualifier) -> supported under the generic path. The specialized
+# path is a strict subset keyed by _SPECIALIZED_FNS below.
 _SUPPORTED: set[tuple[str, str]] = {
+    # Volta / Turing / Ampere core dtypes (specialized + generic)
     ("Ampere", "m16n8k16.f32.f16.f16.f32"),
     ("Turing", "m16n8k8.f32.f16.f16.f32"),
     ("Volta",  "m8n8k4.f32.f16.f16.f32"),
     ("Ampere", "m16n8k16.f32.bf16.bf16.f32"),
     ("Ampere", "m16n8k8.f32.tf32.tf32.f32"),
+    # Ada Lovelace fp8, f32 output (nfb=13, f32_e8m13). Generic path only.
+    ("Ada Lovelace", "m16n8k32.f32.e5m2.e5m2.f32"),
+    ("Ada Lovelace", "m16n8k32.f32.e5m2.e4m3.f32"),
+    ("Ada Lovelace", "m16n8k32.f32.e4m3.e5m2.f32"),
+    ("Ada Lovelace", "m16n8k32.f32.e4m3.e4m3.f32"),
+    ("Ada Lovelace", "m16n8k16.f32.e5m2.e5m2.f32"),
+    ("Ada Lovelace", "m16n8k16.f32.e5m2.e4m3.f32"),
+    ("Ada Lovelace", "m16n8k16.f32.e4m3.e5m2.f32"),
+    ("Ada Lovelace", "m16n8k16.f32.e4m3.e4m3.f32"),
 }
 
 

@@ -130,6 +130,30 @@ _SUPPORTED_MFMA: set[tuple[str, str]] = {
     ("CDNA2", "f32_16x16x8bf16"),
     ("CDNA2", "f32_16x16x2bf16"),
     ("CDNA2", "f32_4x4x2bf16"),
+    # ── Phase N3: fused_dot_rd_add path ──
+    # CDNA3 xf32 (is_xf32, group_size=4)
+    ("CDNA3", "f32_16x16x8_xf32"),
+    ("CDNA3", "f32_32x32x4_xf32"),
+    # CDNA3 f16/bf16 (group_size=min(8, k))
+    ("CDNA3", "f32_32x32x4_2b_f16"),
+    ("CDNA3", "f32_16x16x4_4b_f16"),
+    ("CDNA3", "f32_4x4x4_16b_f16"),
+    ("CDNA3", "f32_32x32x8_f16"),
+    ("CDNA3", "f32_16x16x16_f16"),
+    ("CDNA3", "f32_32x32x4_2b_bf16"),
+    ("CDNA3", "f32_16x16x4_4b_bf16"),
+    ("CDNA3", "f32_4x4x4_16b_bf16"),
+    ("CDNA3", "f32_32x32x8_bf16"),
+    ("CDNA3", "f32_16x16x16_bf16"),
+    # CDNA3 fp8/bf8 (group_size=16, is_fp8 dispatch)
+    ("CDNA3", "f32_16x16x32_bf8_bf8"),
+    ("CDNA3", "f32_16x16x32_bf8_fp8"),
+    ("CDNA3", "f32_16x16x32_fp8_bf8"),
+    ("CDNA3", "f32_16x16x32_fp8_fp8"),
+    ("CDNA3", "f32_32x32x16_bf8_bf8"),
+    ("CDNA3", "f32_32x32x16_bf8_fp8"),
+    ("CDNA3", "f32_32x32x16_fp8_bf8"),
+    ("CDNA3", "f32_32x32x16_fp8_fp8"),
 }
 
 
@@ -497,6 +521,28 @@ class mfma:
             B64 = np.ascontiguousarray(B.detach().cpu().numpy(), dtype=np.float64)
             C64 = np.ascontiguousarray(C.detach().cpu().numpy(), dtype=np.float64)
             out = _rs.mma_f64_batched_rayon(A64[None], B64[None], C64[None])
+            return torch.from_numpy(out[0])
+        if self.operation_type == "fused_dot_rd_add":
+            # CDNA3 TR-FDPA / GTR-FDPA path.
+            # xf32 applies TF32 masking to A/B first (matches oracle).
+            A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            if self.is_xf32:
+                A32 = np.ascontiguousarray(((A32.view(np.int32) >> 13) << 13).view(np.float32))
+                B32 = np.ascontiguousarray(((B32.view(np.int32) >> 13) << 13).view(np.float32))
+            is_fp8 = self.qualifier.endswith("8")
+            # The "8" suffix check: qualifier ends with "fp8" or "bf8"
+            # (not "_1k"). Match oracle's `qualifier.endswith("8")`.
+            # Source dtype's min_exp for extract_significand_exponent:
+            a_min = _MIN_EXP[self.a_type]
+            b_min = _MIN_EXP[self.b_type]
+            out = _rs.mma_f32_amd_fused_rd_rayon(
+                A32[None], B32[None], C32[None],
+                int(self.group_size),
+                24, is_fp8,
+                a_min, b_min, -126,
+            )
             return torch.from_numpy(out[0])
         if self.operation_type == "pairwise":
             # Widen A, B to f32 (matches the oracle patch). Flush A, B, C

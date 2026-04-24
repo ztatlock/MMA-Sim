@@ -1799,6 +1799,7 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_fma_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_amd_pairwise_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_amd_fused_rd_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_wgmma_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f16_out_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
@@ -2266,6 +2267,232 @@ fn run_one_tile_f64(
             out[i * n + j] = sum;
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// N3 — AMD CDNA3 fused_dot_rd_add (Φ_TR-FDPA, Φ_GTR-FDPA).
+//
+// Mirrors mmasim/simulator/arithmetic.py::amd_fused_dot_rd_add. f64
+// arithmetic throughout. Key details:
+//   - RD (round-down / floor) alignment, not RZ or RNE.
+//   - For fp8: split even/odd products, two fused_sum halves, merge
+//     at local max_e with RD at `nfb` fractional bits, then re-align
+//     at global max_e with 31 fractional bits (F_2 per paper Table 7).
+//   - C aligns at 24 fractional bits (F per Table 7).
+//   - Overflow: if any product magnitude >= 2^128, output is ±Inf/NaN.
+//   - After each group, caller rounds the f64 result to d_type (f32) via
+//     Rust's `as f32` (IEEE RNE) — matches the oracle's `torch.tensor(x,
+//     dtype=d_type)` cast.
+// ─────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn amd_fused_dot_rd_add_f64(
+    a: &[f32], b: &[f32], c: f32,
+    n_fractional_bits: i32,
+    is_fp8: bool,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+) -> f64 {
+    // Products + NaN/Inf short-circuit via f64 pre-check.
+    let l = a.len();
+    let mut products = [0.0f64; 64];
+    assert!(l <= 64);
+    let mut fp_sum: f64 = c as f64;
+    for i in 0..l {
+        products[i] = (a[i] as f64) * (b[i] as f64);
+        fp_sum += products[i];
+    }
+    if !fp_sum.is_finite() {
+        return fp_sum;
+    }
+
+    // Overflow partitioning and sig/exp collection.
+    let thresh = fast_pow2(128);
+    let mut p_inf = false;
+    let mut n_inf = false;
+    let mut sigs = [0.0f64; 64];
+    let mut exps = [0i32; 64];
+    let mut n_terms = 0usize;
+    for i in 0..l {
+        if products[i] >= thresh {
+            p_inf = true;
+        } else if products[i] <= -thresh {
+            n_inf = true;
+        } else {
+            let (sa, ea) = extract_sig_exp_f64(a[i] as f64, a_min_exp);
+            let (sb, eb) = extract_sig_exp_f64(b[i] as f64, b_min_exp);
+            sigs[n_terms] = sa * sb;
+            exps[n_terms] = ea + eb;
+            n_terms += 1;
+        }
+    }
+    if p_inf || n_inf {
+        if p_inf && n_inf {
+            return f64::NAN;
+        }
+        return if p_inf { f64::INFINITY } else { f64::NEG_INFINITY };
+    }
+
+    let (sc, ec) = extract_sig_exp_f64(c as f64, c_min_exp);
+
+    // Stage 1: inner fused_sum uses RZ (matches oracle's fused_sum =
+    // math.trunc). The outer alignments (below) use RD (floor). This
+    // interleaving is specific to AMD CDNA3's TR-/GTR-FDPA.
+    let (s_stage1, e_stage1) = if is_fp8 {
+        let mut s0_sig = [0.0f64; 64];
+        let mut s0_exp = [0i32; 64];
+        let mut n0 = 0;
+        let mut s1_sig = [0.0f64; 64];
+        let mut s1_exp = [0i32; 64];
+        let mut n1 = 0;
+        for i in 0..n_terms {
+            if i % 2 == 0 {
+                s0_sig[n0] = sigs[i]; s0_exp[n0] = exps[i]; n0 += 1;
+            } else {
+                s1_sig[n1] = sigs[i]; s1_exp[n1] = exps[i]; n1 += 1;
+            }
+        }
+        let (s0, e0) = fused_sum_f64(&s0_sig[..n0], &s0_exp[..n0], n_fractional_bits);
+        let (s1, e1) = fused_sum_f64(&s1_sig[..n1], &s1_exp[..n1], n_fractional_bits);
+        let max_e_local = e0.max(e1);
+        let nfb_pow = fast_pow2(n_fractional_bits);
+        // Outer alignment: RD (floor), matches oracle's math.floor.
+        let s0a = (s0 * fast_pow2(n_fractional_bits + e0 - max_e_local)).floor() / nfb_pow;
+        let s1a = (s1 * fast_pow2(n_fractional_bits + e1 - max_e_local)).floor() / nfb_pow;
+        (s0a + s1a, max_e_local)
+    } else {
+        fused_sum_f64(&sigs[..n_terms], &exps[..n_terms], n_fractional_bits)
+    };
+
+    // Stage 2: re-align s at 31 bits and C at 24 bits, both at global max_e.
+    let max_e = e_stage1.max(ec);
+    let s_final = (s_stage1 * fast_pow2(31 + e_stage1 - max_e)).floor() * fast_pow2(-31);
+    let sc_final = if is_fp8 && ec < max_e - 25 {
+        0.0
+    } else {
+        (sc * fast_pow2(24 + ec - max_e)).floor() * fast_pow2(-24)
+    };
+
+    (s_final + sc_final) * fast_pow2(max_e)
+}
+
+/// Variant of fused_sum with RD (floor) alignment rather than RZ (trunc).
+/// Matches the oracle's use of `math.floor` in amd_fused_dot_rd_add.
+#[inline]
+fn fused_sum_rd(sigs: &[f64], exps: &[i32], nfb: i32) -> (f64, i32) {
+    let max_e = *exps.iter().max().unwrap();
+    let nfb_pow = fast_pow2(nfb);
+    let mut acc = 0.0f64;
+    for i in 0..sigs.len() {
+        let shift = nfb + exps[i] - max_e;
+        let scaled = sigs[i] * fast_pow2(shift);
+        acc += scaled.floor();
+    }
+    (acc / nfb_pow, max_e)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_amd_fused_rd(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    group_size: usize,
+    n_fractional_bits: i32,
+    is_fp8: bool,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out: &mut [f32],
+) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = c[i * n + j];
+            let mut l = 0usize;
+            while l < k {
+                let end = (l + group_size).min(k);
+                let gs = end - l;
+                let mut a_buf = [0f32; 64];
+                let mut b_buf = [0f32; 64];
+                for ll in 0..gs {
+                    a_buf[ll] = a[i * k + l + ll];
+                    b_buf[ll] = b[(l + ll) * n + j];
+                }
+                let group_sum = amd_fused_dot_rd_add_f64(
+                    &a_buf[..gs], &b_buf[..gs], sum,
+                    n_fractional_bits, is_fp8,
+                    a_min_exp, b_min_exp, c_min_exp,
+                );
+                // RNE cast from f64 to f32 (matches oracle's
+                // `torch.tensor(x, dtype=self.d_type)` where d_type=f32).
+                sum = group_sum as f32;
+                l += group_size;
+            }
+            out[i * n + j] = sum;
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, group_size, n_fractional_bits, is_fp8, a_min_exp, b_min_exp, c_min_exp))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_amd_fused_rd_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    group_size: usize,
+    n_fractional_bits: i32,
+    is_fp8: bool,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    assert!(group_size <= 64);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((o, a), b), c)| {
+                run_one_tile_amd_fused_rd(
+                    a, b, c, m, n, k, group_size,
+                    n_fractional_bits, is_fp8,
+                    a_min_exp, b_min_exp, c_min_exp, o,
+                );
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
 }
 
 // ─────────────────────────────────────────────────────────────────────

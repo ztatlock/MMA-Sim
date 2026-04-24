@@ -61,6 +61,16 @@ REGISTRY: list[InstSpec] = [
     InstSpec("amd-cdna3-bf16-n",   "mfma", "CDNA3", "f32_32x32x8_bf16"),
     InstSpec("amd-cdna3-fp8-fp8",  "mfma", "CDNA3", "f32_16x16x32_fp8_fp8"),
     InstSpec("amd-cdna3-bf8-bf8",  "mfma", "CDNA3", "f32_16x16x32_bf8_bf8"),
+    # wider wgmma — phase N4.
+    InstSpec("hopper-wgmma-f16-n128",  "wgmma", "Hopper", "m64n128k16.f32.f16.f16"),
+    InstSpec("hopper-wgmma-f16-n256",  "wgmma", "Hopper", "m64n256k16.f32.f16.f16"),
+    InstSpec("hopper-wgmma-fp8",       "wgmma", "Hopper", "m64n64k32.f32.e4m3.e4m3"),
+    # Blackwell tcgen05mma — phase N4.
+    InstSpec("blackwell-tcgen-f16",    "tcgen05mma", "Blackwell", "m64n64k16.f32.f16.f16"),
+    InstSpec("blackwell-tcgen-bf16",   "tcgen05mma", "Blackwell", "m64n64k16.f32.bf16.bf16"),
+    InstSpec("blackwell-tcgen-tf32",   "tcgen05mma", "Blackwell", "m64n64k8.f32.tf32.tf32"),
+    InstSpec("blackwell-tcgen-fp8",    "tcgen05mma", "Blackwell", "m64n64k32.f32.e4m3.e4m3"),
+    InstSpec("blackwell-tcgen-m128-f16", "tcgen05mma", "Blackwell", "m128n128k16.f32.f16.f16"),
     # Hopper wgmma — phase M4. f32-output subset.
     InstSpec("hopper-wgmma-f16-n64",  "wgmma", "Hopper", "m64n64k16.f32.f16.f16"),
     InstSpec("hopper-wgmma-bf16-n64", "wgmma", "Hopper", "m64n64k16.f32.bf16.bf16"),

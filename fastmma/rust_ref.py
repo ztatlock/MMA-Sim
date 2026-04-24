@@ -416,8 +416,8 @@ class mma:
 
 
 _SUPPORTED_WGMMA: set[tuple[str, str]] = {
-    # Hopper wgmma, f32-output subset (Phase M4). f16-output would need
-    # RNE instead of our RZ — deferred.
+    # Hopper wgmma, f32-output subset (Phase M4/N4). f16-output would need
+    # extending the f16-bits kernel to large tiles — deferred.
     ("Hopper", "m64n64k16.f32.f16.f16"),
     ("Hopper", "m64n64k16.f32.bf16.bf16"),
     ("Hopper", "m64n64k8.f32.tf32.tf32"),
@@ -425,11 +425,54 @@ _SUPPORTED_WGMMA: set[tuple[str, str]] = {
     ("Hopper", "m64n128k16.f32.bf16.bf16"),
     ("Hopper", "m64n128k8.f32.tf32.tf32"),
     ("Hopper", "m64n256k16.f32.f16.f16"),
+    ("Hopper", "m64n256k16.f32.bf16.bf16"),
     ("Hopper", "m64n256k8.f32.tf32.tf32"),
     ("Hopper", "m64n8k16.f32.f16.f16"),
     ("Hopper", "m64n8k16.f32.bf16.bf16"),
     ("Hopper", "m64n8k8.f32.tf32.tf32"),
+    # Hopper wgmma fp8 (f32-output, nfb=13, f32_e8m13)
+    ("Hopper", "m64n64k32.f32.e4m3.e4m3"),
+    ("Hopper", "m64n64k32.f32.e4m3.e5m2"),
+    ("Hopper", "m64n64k32.f32.e5m2.e4m3"),
+    ("Hopper", "m64n64k32.f32.e5m2.e5m2"),
 }
+
+
+_SUPPORTED_TCGEN05MMA: set[tuple[str, str]] = {
+    # Blackwell tcgen05mma (m ∈ {64, 128}). f32-output subset. Math is
+    # identical to wgmma (both call nv_fused_dot_add). Re-uses the wgmma
+    # Rust kernel.
+    # m=64
+    ("Blackwell", "m64n64k16.f32.f16.f16"),
+    ("Blackwell", "m64n64k16.f32.bf16.bf16"),
+    ("Blackwell", "m64n64k8.f32.tf32.tf32"),
+    ("Blackwell", "m64n64k32.f32.e4m3.e4m3"),
+    # m=128
+    ("Blackwell", "m128n128k16.f32.f16.f16"),
+    ("Blackwell", "m128n128k16.f32.bf16.bf16"),
+    ("Blackwell", "m128n128k8.f32.tf32.tf32"),
+    ("Blackwell", "m128n128k32.f32.e4m3.e4m3"),
+}
+
+
+def _call_wgmma_style(obj, A, B, C):
+    """Shared f32-output wgmma/tcgen05mma dispatch. Both oracle classes
+    use the same nv_fused_dot_add math; we reuse the heap-allocated
+    Rust kernel."""
+    assert A.shape == (obj.m, obj.k)
+    assert B.shape == (obj.k, obj.n)
+    assert C.shape == (obj.m, obj.n)
+    A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+    B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+    C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+    if obj.a_type is torch.float32:  # tf32
+        A32 = np.ascontiguousarray(((A32.view(np.int32) >> 13) << 13).view(np.float32))
+        B32 = np.ascontiguousarray(((B32.view(np.int32) >> 13) << 13).view(np.float32))
+    out = _rs.mma_f32_out_wgmma_batched_rayon(
+        A32[None], B32[None], C32[None],
+        obj.nfb, obj._a_min, obj._b_min, obj._c_min, obj._out_mant_bits,
+    )
+    return torch.from_numpy(out[0])
 
 
 class wgmma:
@@ -452,11 +495,8 @@ class wgmma:
             raise NotImplementedError(
                 f"rust_ref.wgmma: ({arch!r}, {qualifier!r}) not supported"
             )
-
         if self.d_type is not torch.float32:
-            raise NotImplementedError(
-                f"wgmma f16-output variants need RNE (deferred)"
-            )
+            raise NotImplementedError("wgmma f16-output deferred")
 
         self._out_mant_bits = 13 if self.output_type == "f32_e8m13" else 23
         self._a_min = _MIN_EXP[self.a_type]
@@ -464,20 +504,40 @@ class wgmma:
         self._c_min = _MIN_EXP[self.c_type]
 
     def __call__(self, A, B, C):
-        assert A.shape == (self.m, self.k)
-        assert B.shape == (self.k, self.n)
-        assert C.shape == (self.m, self.n)
-        A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
-        B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
-        C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
-        if self.a_type is torch.float32:  # tf32
-            A32 = np.ascontiguousarray(((A32.view(np.int32) >> 13) << 13).view(np.float32))
-            B32 = np.ascontiguousarray(((B32.view(np.int32) >> 13) << 13).view(np.float32))
-        out = _rs.mma_f32_out_wgmma_batched_rayon(
-            A32[None], B32[None], C32[None],
-            self.nfb, self._a_min, self._b_min, self._c_min, self._out_mant_bits,
-        )
-        return torch.from_numpy(out[0])
+        return _call_wgmma_style(self, A, B, C)
+
+
+class tcgen05mma:
+    """Rust-backed Blackwell tcgen05mma. f32-output subset; same math
+    as wgmma, just with Blackwell shapes and dtype combinations."""
+
+    def __init__(self, arch: str, qualifier: str):
+        from mmasim.simulator.nv_ptx import tcgen05mma as _oracle_tcg
+        _ref = _oracle_tcg(arch, qualifier)
+        self.arch = arch
+        self.qualifier = qualifier
+        self.m, self.n, self.k = _ref.m, _ref.n, _ref.k
+        self.a_type = _ref.a_type
+        self.b_type = _ref.b_type
+        self.c_type = _ref.c_type
+        self.d_type = _ref.d_type
+        self.nfb = _ref.n_accum_fractional_bits
+        self.output_type = _ref.output_type
+
+        if (arch, qualifier) not in _SUPPORTED_TCGEN05MMA:
+            raise NotImplementedError(
+                f"rust_ref.tcgen05mma: ({arch!r}, {qualifier!r}) not supported"
+            )
+        if self.d_type is not torch.float32:
+            raise NotImplementedError("tcgen05mma f16-output deferred")
+
+        self._out_mant_bits = 13 if self.output_type == "f32_e8m13" else 23
+        self._a_min = _MIN_EXP[self.a_type]
+        self._b_min = _MIN_EXP[self.b_type]
+        self._c_min = _MIN_EXP[self.c_type]
+
+    def __call__(self, A, B, C):
+        return _call_wgmma_style(self, A, B, C)
 
 
 class mfma:

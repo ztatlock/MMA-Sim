@@ -53,6 +53,11 @@ REGISTRY: list[InstSpec] = [
     InstSpec("hopper-wgmma-f16-n64",  "wgmma", "Hopper", "m64n64k16.f32.f16.f16"),
     InstSpec("hopper-wgmma-bf16-n64", "wgmma", "Hopper", "m64n64k16.f32.bf16.bf16"),
     InstSpec("hopper-wgmma-tf32-n64", "wgmma", "Hopper", "m64n64k8.f32.tf32.tf32"),
+    # f16-output variants — phase N1 (RNE-FP16)
+    InstSpec("ampere-f16-f16",   "mma", "Ampere",       "m16n8k16.f16.f16.f16.f16"),
+    InstSpec("turing-f16-f16",   "mma", "Turing",       "m16n8k8.f16.f16.f16.f16"),
+    InstSpec("volta-f16-f16",    "mma", "Volta",        "m8n8k4.f16.f16.f16.f16"),
+    InstSpec("ada-fp8-e4m3-f16", "mma", "Ada Lovelace", "m16n8k32.f16.e4m3.e4m3.f16"),
 ]
 
 

@@ -34,6 +34,23 @@ _SUPPORTED: set[tuple[str, str]] = {
     ("Ada Lovelace", "m16n8k16.f32.e5m2.e4m3.f32"),
     ("Ada Lovelace", "m16n8k16.f32.e4m3.e5m2.f32"),
     ("Ada Lovelace", "m16n8k16.f32.e4m3.e4m3.f32"),
+    # ── f16-output variants (RNE to 10 mantissa bits) ── Phase N1 ──
+    # Volta f16/f16
+    ("Volta", "m8n8k4.f16.f16.f16.f16"),
+    ("Volta", "m8n8k4.f32.f16.f16.f16"),
+    # Turing f16/f16
+    ("Turing", "m16n8k8.f16.f16.f16.f16"),
+    # Ampere f16/f16
+    ("Ampere", "m16n8k16.f16.f16.f16.f16"),
+    # Ada Lovelace fp8 → f16
+    ("Ada Lovelace", "m16n8k32.f16.e5m2.e5m2.f16"),
+    ("Ada Lovelace", "m16n8k32.f16.e5m2.e4m3.f16"),
+    ("Ada Lovelace", "m16n8k32.f16.e4m3.e5m2.f16"),
+    ("Ada Lovelace", "m16n8k32.f16.e4m3.e4m3.f16"),
+    ("Ada Lovelace", "m16n8k16.f16.e5m2.e5m2.f16"),
+    ("Ada Lovelace", "m16n8k16.f16.e5m2.e4m3.f16"),
+    ("Ada Lovelace", "m16n8k16.f16.e4m3.e5m2.f16"),
+    ("Ada Lovelace", "m16n8k16.f16.e4m3.e4m3.f16"),
     # F64 — uses dedicated `mma_f64_batched_rayon` Rust entry (serial FMA).
     ("Ampere", "m8n8k4.f64.f64.f64.f64"),
     ("Hopper", "m16n8k16.f64.f64.f64.f64"),
@@ -134,6 +151,8 @@ class mma:
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
         if self.d_type is torch.float64:
             return self._call_f64_single(A, B, C)
+        if self.d_type is torch.float16:
+            return self._call_f16_out_single(A, B, C)
 
         A_f32 = self._to_f32_contig(A)
         B_f32 = self._to_f32_contig(B)
@@ -156,6 +175,20 @@ class mma:
             self.is_split_k,
         )
         return torch.from_numpy(out)
+
+    def _call_f16_out_single(self, A, B, C):
+        """f16-output path (RNE-FP16). Routes through batched entry with B=1."""
+        A_f32 = self._to_f32_contig(A)
+        B_f32 = self._to_f32_contig(B)
+        C_f32 = self._to_f32_contig(C)
+        # tf32 masking not applicable here (inputs are f16/bf16/fp8).
+        out_u16 = _rs.mma_f16_out_batched_rayon(
+            A_f32[None], B_f32[None], C_f32[None],
+            self.nfb,
+            self._a_min, self._b_min, self._c_min,
+            self.is_split_k,
+        )
+        return torch.from_numpy(out_u16[0]).view(torch.float16)
 
     def _call_f64_single(self, A, B, C):
         # Single-call f64: route through the batched entry with batch=1.

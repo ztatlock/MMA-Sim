@@ -110,6 +110,70 @@ fn guarded_shl(x: i64, shift: i32) -> i64 {
 /// Mirrors fastmma/numpy_ref.py::_normalize_f32 — RZ to `out_mantissa_bits`,
 /// cast to f32, NaN/Inf passthrough.
 #[inline(always)]
+/// Normalize a computed f64 value to f16 bits with RNE-to-10-mantissa-bits.
+/// Mirrors the oracle's f16-output path:
+///   s, e = extract_sig_exp(result, f16_min_exp=-14)
+///   s = round_ties_even(s * 2^10) / 2^10
+///   return f16(s * 2^e)
+/// NaN pattern: 0x7FFF (oracle convention).
+fn normalize_f16_rne_bits(result_f64: f64) -> u16 {
+    if result_f64.is_nan() {
+        return 0x7FFFu16;
+    }
+    if result_f64.is_infinite() {
+        return if result_f64 > 0.0 { 0x7C00 } else { 0xFC00 };
+    }
+    if result_f64 == 0.0 {
+        return if result_f64.is_sign_negative() { 0x8000 } else { 0 };
+    }
+
+    // Extract (sig, exp) with flush at f16's min_exp = -14.
+    let (mut s, e_isz) = libm::frexp(result_f64);
+    let mut e: i32 = e_isz as i32;
+    s *= 2.0;
+    e -= 1;
+    if e < -14 {
+        s *= fast_pow2(e - (-14));
+        e = -14;
+    }
+    // RNE to 10 mantissa bits: round to nearest multiple of 2^-10.
+    let mut s_rne = (s * 1024.0).round_ties_even() / 1024.0;
+
+    // If rounding pushed |s| to 2.0 exactly, re-normalize.
+    if s_rne >= 2.0 {
+        s_rne = 1.0;
+        e += 1;
+    } else if s_rne <= -2.0 {
+        s_rne = -1.0;
+        e += 1;
+    }
+
+    // Overflow → ±Inf.
+    if e > 15 {
+        return if s_rne > 0.0 { 0x7C00 } else { 0xFC00 };
+    }
+
+    let sign_bit: u16 = if s_rne < 0.0 { 0x8000 } else { 0 };
+    let mag = s_rne.abs();
+
+    // Subnormal: e == -14 and mag < 1. Encode with biased_e=0, mantissa = mag * 1024.
+    // (Our flush above only sets e to -14, mag into [0, 1) in that case.)
+    if mag < 1.0 {
+        debug_assert_eq!(e, -14);
+        let mantissa = (mag * 1024.0).round_ties_even() as u16;
+        // If mantissa rounds up to 1024, that's the smallest normal (biased_e=1, mant=0).
+        if mantissa >= 1024 {
+            return sign_bit | (1u16 << 10);
+        }
+        return sign_bit | (mantissa & 0x3FF);
+    }
+
+    // Normal: biased_e = e + 15, mantissa = (mag - 1) * 1024.
+    let biased_e = (e + 15) as u16;
+    let mantissa = ((mag - 1.0) * 1024.0).round_ties_even() as u16;
+    sign_bit | (biased_e << 10) | (mantissa & 0x3FF)
+}
+
 fn normalize_f32(result_f64: f64, out_mantissa_bits: i32) -> f32 {
     if result_f64.is_nan() {
         return f32::from_bits(0x7FFF_FFFF);
@@ -762,6 +826,269 @@ fn mma_f32_out_batched_simd<'py>(
 // Release the GIL during the parallel section (py.allow_threads) so
 // other Python threads can progress; our inner work is pure Rust.
 // ─────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────
+// N1 — Generic kernel with f16 output (RNE to 10 mantissa bits).
+//
+// Same integer pipeline as `fused_mma_step_int`; the only difference is
+// the output normalize. Returns u16 (raw f16 bits) so the Python wrapper
+// can view-cast to torch.float16 without losing the NaN pattern.
+// ─────────────────────────────────────────────────────────────────────
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_f16_out(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    split_k: bool,
+    out: &mut [u16],
+) {
+    // This is simplest implemented as "run f32-output kernel into a scratch
+    // buffer, then convert each element to f16 via a final re-decomp". But
+    // that's two roundings which is wrong. Instead: mirror fused_mma_step_int
+    // inline, but with f16 normalize at the end (and when split-K is on,
+    // the mid pass also uses f16-bit output then re-read as f16→f64).
+    //
+    // For split-K, the oracle's intermediate C (= mid) IS in f16 (since
+    // output_type="f16" means each step produces f16, and that f16 is the
+    // next step's C). That's what mmasim/simulator/nv_ptx.py:96 shows
+    // (D[i][j] = sum, where sum is f16 after nv_fused_dot_add).
+
+    if split_k {
+        let half = k / 2;
+        let mut mid_bits = vec![0u16; m * n];
+        run_one_tile_f16_out_single(
+            a, b, c, m, n, half, nfb,
+            a_min_exp, b_min_exp, c_min_exp,
+            true, // A is A[:, :half]
+            &mut mid_bits,
+        );
+        // Second pass: C is mid (as f16).
+        let mid_f32: Vec<f32> = mid_bits.iter()
+            .map(|&b| f16_bits_to_f32(b))
+            .collect();
+        run_one_tile_f16_out_single(
+            a, b, c, m, n, half, nfb,
+            a_min_exp, b_min_exp, -14, // mid is f16 → min_exp = -14
+            false, // A is A[:, half:]
+            out,
+        );
+        // Wait — we need to pass mid_f32 as C in the second call. Refactor:
+        let _ = mid_f32;
+        unreachable!("see run_one_tile_f16_out_single below — split-K needs explicit wiring");
+    } else {
+        run_one_tile_f16_out_single(
+            a, b, c, m, n, k, nfb,
+            a_min_exp, b_min_exp, c_min_exp,
+            false, // a_is_first_half: irrelevant when not split
+            out,
+        );
+    }
+}
+
+#[inline]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    // Manual f16 → f32 conversion (exact).
+    let sign = ((bits >> 15) & 1) as u32;
+    let biased_e = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    let f32_bits = if biased_e == 0 && mant == 0 {
+        sign << 31
+    } else if biased_e == 0x1F {
+        // Inf or NaN
+        if mant == 0 {
+            (sign << 31) | 0x7F800000
+        } else {
+            // Preserve NaN payload (align 10-bit mant to 23-bit f32 mant).
+            (sign << 31) | 0x7F800000 | (mant << 13)
+        }
+    } else if biased_e == 0 {
+        // Subnormal f16
+        let mut e: i32 = -14;
+        let mut m = mant;
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        let new_biased = (e + 127) as u32;
+        let new_mant = (m & 0x3FF) << 13;
+        (sign << 31) | (new_biased << 23) | new_mant
+    } else {
+        // Normal f16 → normal f32
+        let new_biased = (biased_e as i32 - 15 + 127) as u32;
+        (sign << 31) | (new_biased << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Single-pass f16-output kernel. `a_is_first_half` is a hint for split-K
+/// slicing (caller responsibility to pass correct A/B pointers).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_f16_out_single(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    _a_is_first_half: bool,
+    out: &mut [u16],
+) {
+    // Allocate on heap to avoid stack size issues for arbitrary shapes.
+    let mut a_sig = vec![0i64; m * k];
+    let mut a_exp = vec![0i32; m * k];
+    for i in 0..m * k {
+        let (s, e, _) = decompose(a[i], a_min_exp, nfb);
+        a_sig[i] = s;
+        a_exp[i] = e;
+    }
+    let mut b_sig = vec![0i64; k * n];
+    let mut b_exp = vec![0i32; k * n];
+    for i in 0..k * n {
+        let (s, e, _) = decompose(b[i], b_min_exp, nfb);
+        b_sig[i] = s;
+        b_exp[i] = e;
+    }
+
+    for i in 0..m {
+        for j in 0..n {
+            let (c_sig_ij, c_exp_ij, _) = decompose(c[i * n + j], c_min_exp, nfb);
+            let mut fp_sum = c[i * n + j] as f64;
+
+            let mut prod_sig = [0i64; 128];
+            let mut prod_exp = [0i32; 128];
+            let mut max_e = c_exp_ij;
+            assert!(k <= 128);
+
+            for l in 0..k {
+                let a_s = a_sig[i * k + l];
+                let a_e = a_exp[i * k + l];
+                let b_s = b_sig[l * n + j];
+                let b_e = b_exp[l * n + j];
+                fp_sum += (a[i * k + l] as f64) * (b[l * n + j] as f64);
+                let ps = a_s * b_s;
+                let pe = a_e + b_e;
+                prod_sig[l] = ps;
+                prod_exp[l] = pe;
+                if pe > max_e { max_e = pe; }
+            }
+
+            let result_f64 = if !fp_sum.is_finite() {
+                fp_sum
+            } else {
+                let mut acc: i64 = trunc_shr(c_sig_ij, max_e - c_exp_ij);
+                for l in 0..k {
+                    let shift = max_e - prod_exp[l] + nfb;
+                    acc += trunc_shr(prod_sig[l], shift);
+                }
+                (acc as f64) * fast_pow2(max_e - nfb)
+            };
+
+            out[i * n + j] = normalize_f16_rne_bits(result_f64);
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, split_k))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f16_out_batched_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    split_k: bool,
+) -> PyResult<Bound<'py, PyArray3<u16>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0u16; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((o, a), b), c)| {
+                if split_k {
+                    // Two-pass: first half writes mid (f16 bits), then
+                    // converts back to f32 for the second half's C.
+                    let half = k / 2;
+                    let mut mid = vec![0u16; m * n];
+
+                    // Split A into two contiguous halves.
+                    let mut a1 = vec![0f32; m * half];
+                    let mut a2 = vec![0f32; m * half];
+                    for i in 0..m {
+                        a1[i * half..(i + 1) * half]
+                            .copy_from_slice(&a[i * k..i * k + half]);
+                        a2[i * half..(i + 1) * half]
+                            .copy_from_slice(&a[i * k + half..(i + 1) * k]);
+                    }
+
+                    run_one_tile_f16_out_single(
+                        &a1, &b[..half * n], c, m, n, half,
+                        nfb, a_min_exp, b_min_exp, c_min_exp,
+                        false, &mut mid,
+                    );
+                    // Convert mid (f16 bits) → f32 for second pass's C.
+                    let mid_f32: Vec<f32> = mid.iter().map(|&b| f16_bits_to_f32(b)).collect();
+                    run_one_tile_f16_out_single(
+                        &a2, &b[half * n..], &mid_f32, m, n, half,
+                        nfb, a_min_exp, b_min_exp, -14,
+                        false, o,
+                    );
+                } else {
+                    run_one_tile_f16_out_single(
+                        a, b, c, m, n, k,
+                        nfb, a_min_exp, b_min_exp, c_min_exp,
+                        false, o,
+                    );
+                }
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
+// Silence the unreachable-macro-using placeholder.
+#[allow(dead_code)]
+fn _f16_placeholder_touch() {
+    let _ = run_one_tile_f16_out;
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // M4 — Heap-allocated generic kernel for large tiles (wgmma, tcgen05mma).
@@ -1472,6 +1799,7 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_fma_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_wgmma_batched_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f16_out_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_mxfp4_k64_rayon, &m)?)?;
     #[cfg(target_os = "macos")]

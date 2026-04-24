@@ -9,18 +9,20 @@ A drop-in replacement for `mmasim` that produces **bit-identical** outputs
 across every supported (arch, instruction, dtype) combination, fast
 enough for realistic-scale simulations (millions of tiles).
 
-## Status (2026-04-23)
+## Status (2026-04-23, after Branch A)
 
-**Perf:** 5 of 10 fixtures specialized on CPU at **~10⁴× over the
-Python oracle** (ampere-f16 workhorse: 0.581 μs/tile = 16 180×).
+**Perf:** ampere-f16 workhorse specialized at 0.581 μs/tile (16 180×).
 Metal GPU port works bit-exact but doesn't beat CPU at tested sizes.
 
-**Coverage:** 5/10 fixtures (f16/bf16/tf32 inputs, f32 output, Volta
-through Ampere). Missing: f64, fp8, fp4, block-scaled, AMD, wgmma,
-tcgen05mma.
+**Coverage:** **13 instruction types, 32 bit-exact fixtures** (random +
+edge corpora). Covers NVIDIA `mma` (Volta→Blackwell), `mma_block_scale`
+(Blackwell mxfp8/mxfp4), `wgmma` (Hopper f32-output), AMD `mfma`
+(fma operation_type). Still missing: f16-output (RNE), AMD pairwise /
+fused_dot_rd_add paths, tcgen05mma, wider wgmma n (>64).
 
-**Validation:** corpus-based, seeded RNG samples vs Python oracle.
-Never validated against real GPU silicon.
+**Validation:** corpus-based, 5 RNG seeds × ~10 samples × 13
+instructions = ~200 curated validation points. Not yet validated
+against real GPU silicon.
 
 ## Guiding principles (unchanged)
 
@@ -44,6 +46,13 @@ Never validated against real GPU silicon.
 | 3.0    | hand-specialized ampere-f16                | 0.603         | 15 588×  |
 | 3.1    | const-generic across all 5 supported       | 0.581         | 16 179×  |
 | 4      | Metal GPU (ampere-f16 only)                | 1.00 / 0.25 * | varies  |
+| M1a    | Ada fp8 f32-output (8 qualifiers)          | 0.020         | 580×     |
+| M1b    | F64 kernel (Ampere + Hopper)               | 0.004         | ≥ 270×   |
+| M1c    | Block-scaled mxfp8 (Blackwell k=32)        | 0.028         | 355×     |
+| M1d    | Block-scaled mxfp4 (Blackwell k=64)        | 0.020         | 1 593×   |
+| M2     | Edge-case corpus (NaN/Inf/zeros/extremes)  | —             | —        |
+| M3     | AMD MFMA fma-subset (f64/f32 non-xf32)     | 0.005–0.007   | 800–1 400× |
+| M4     | Hopper wgmma f32-output (3 qualifiers)     | 0.105–0.154   | 1 300×   |
 
 \* Metal: 1.00 μs/tile at B=1024, 0.25 μs/tile at B=65k. Loses to CPU
 at practical batch sizes; matches at extreme batches.
@@ -68,27 +77,24 @@ These aren't exclusive, but they serve different goals. Priorities
 below reflect the user's stated goal: *trustworthy, reliable,
 bit-accurate simulation at scale*.
 
-### Branch A — Coverage (priority: high)
+### Branch A — Coverage (largely COMPLETE; remainders below)
 
-Extend the specialized kernel set from 5/10 to 10/10 supported fixtures
-and beyond. Each is plumbing, not invention, but unglamorous:
+Everything tractable without new algorithm work landed in milestones
+M1a–M4 (commits d8eef34..38c6d0f). What remains:
 
-1. **f64 inputs (`ampere-f64`, `hopper-f64`)**. Oracle uses serial
-   `libm::fma` with single rounding per step. Needs a Rust vectorized
-   FMA intrinsic (`std::arch::aarch64::vfmaq_f64` or similar) and a
-   different kernel shape (pairwise reduction, not integer alignment).
-2. **fp8 inputs with Ada Lovelace's `f32_e8m13` output** (`ada-fp8-e4m3`).
-   Already infrastructure-supported; just needs wiring.
-3. **fp4 + block-scaled** (`blackwell-mxfp8`, `blackwell-mxfp4`).
-   New `mma_block_scale` entry class, `unpack_fp4_tensor` equivalent,
-   scale handling in fused_sum.
-4. **AMD MFMA.** New ISA class (`mmasim.isa.amd`), RD rounding mode,
-   different accumulator width (35 fractional bits for mxfp4).
-5. **wgmma / tcgen05mma.** Collective matmuls for Hopper / Blackwell.
-   Distinct ISA surface.
+1. **f16-output variants.** Oracle uses RNE for f16 output; our
+   normalize uses RZ. Needed for: wgmma f16-output, Ada fp8 f16-output
+   (16 qualifiers), Blackwell f8f6f4 f16-output. ~½ day to add an
+   `normalize_f16_rne` path.
+2. **AMD pairwise + fused_dot_rd_add paths.** Covers CDNA1/2 f16/bf16
+   (pairwise) and CDNA3 xf32/f16/bf16/fp8 (fused_dot_rd_add with RD
+   rounding). ~1 day. RD rounding is the non-trivial piece.
+3. **tcgen05mma.** Collective Blackwell matmul; math identical to
+   wgmma per-tile (same `nv_fused_dot_add`). ~30 min plumbing.
+4. **Wider wgmma n.** Tested n=64, ISA supports n up to 256. Kernel
+   should already handle; register qualifiers. ~30 min.
 
-**Estimated effort:** 2–3 focused days total. None require
-algorithmic invention.
+**Estimated remaining effort:** ~2 days, no algorithmic novelty.
 
 ### Branch B — Validation against real silicon (priority: high)
 
@@ -137,22 +143,29 @@ honest negative result on GPU.
 This isn't mutually exclusive with A/B. Coverage and hardware
 validation would make the writeup stronger.
 
-## My recommendation (in the spirit of your feedback)
+## Updated recommendation (after Branch A lands)
 
-**Coverage (A) → Hardware validation (B)**, in that order, before any
-more perf work:
+**Hardware validation (B) is now the single highest-value task.**
+Coverage A is largely done (13 instruction types, 32 bit-exact
+fixtures). Our "bit-exact" claim is relative to the Python oracle;
+the oracle's own claim to be bit-accurate against real silicon has
+never been tested. Getting access to an actual NVIDIA/AMD GPU and
+running our corpus on it would either:
 
-- A fills in the drop-in-library goal you stated. Every new fixture
-  that passes is more of the actual ISA covered.
-- B answers the load-bearing unknown: is the oracle right? If the
-  oracle has bugs, our impl inherits them silently. Checking before
-  we publish or depend on this matters.
-- If after A+B the perf ceiling still feels insufficient for the target
-  workload, return to C.
+- Confirm the oracle (and our impl) match silicon → publishable
+  reference implementation, enables trustworthy simulation at scale.
+- Surface oracle bugs → we fix upstream, add regression tests, the
+  field gains a more accurate tool.
 
-The Phase 4 (Metal) result suggests diminishing returns on pure
-perf work on this hardware. Time better spent on the correctness
-foundation.
+Either outcome is valuable. Without this step, the library's
+correctness is only as good as the oracle's correctness, which is an
+unmeasured assumption.
+
+**Secondary priorities:**
+- Residual coverage (A continuation): f16-output, AMD non-fma paths,
+  tcgen05mma, wider wgmma. ~2 days, no research content.
+- Perf work (C / i32 rewrite): diminishing returns but plausible
+  ~10× on CPU, ~5× on GPU. Defer until workload demands it.
 
 ## Non-goals (for now)
 

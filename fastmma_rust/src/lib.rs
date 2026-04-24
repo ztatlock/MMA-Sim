@@ -1330,6 +1330,7 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_mxfp4_k64_rayon, &m)?)?;
     #[cfg(target_os = "macos")]
     m.add_function(wrap_pyfunction!(mma_metal_ampere_f16, &m)?)?;
     Ok(())
@@ -1516,6 +1517,248 @@ fn mma_f32_out_block_scale_k32_rayon<'py>(
                     m, n, k,
                     nfb, a_min_exp, b_min_exp, c_min_exp,
                     out_mantissa_bits, out_i,
+                );
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M1d — Block-scaled mxfp4 (k=64, per-block scales, fp4 packed inputs).
+//
+// Oracle [nv_ptx.py:132-143]: unpacks A and B from fp4 bytes, then uses
+// `nv_fused_dot_add_with_block_scale` which (per block of 16 elements):
+//   1. Sums a[k:k+16] * b[k:k+16] as f64 → block_sum.
+//   2. Extracts scale_a[k/block_size] and scale_b[k/block_size] exps.
+//   3. Appends (block_sum, scale_a_exp + scale_b_exp) as a fused_sum
+//      term (with scale sig = 1 for ue8m0 — which is our corpus case).
+// Plus C as an initial term. Then fused_sum, normalize f32 RZ.
+//
+// We stay in f64 throughout this kernel (no integer pipeline): the
+// per-block sums are small, the sums fit in 53 bits, and matching the
+// oracle's f64 trunc() path is the most direct route to bit-exact.
+// NFB=35.
+// ─────────────────────────────────────────────────────────────────────
+
+/// FP4 e2m1 decode table (oracle arithmetic.py:37-50). Indexed by raw
+/// 4-bit value: bit 3 is sign, bits 0-2 select magnitude.
+const FP4_TABLE: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+#[inline(always)]
+fn unpack_fp4_byte(packed: u8) -> (f32, f32) {
+    let lo = (packed & 0x0F) as usize;
+    let hi = (packed >> 4) as usize;
+    (FP4_TABLE[lo], FP4_TABLE[hi])
+}
+
+/// f64 equivalent of the oracle's extract_significand_exponent.
+/// Returns sig in [1, 2) or 0, integer exp, with subnormal flush at min_exp.
+#[inline(always)]
+fn extract_sig_exp_f64(x: f64, min_exp: i32) -> (f64, i32) {
+    if x == 0.0 { return (0.0, -126); }
+    let (mut s, e_isz) = libm::frexp(x);
+    let mut e: i32 = e_isz as i32;
+    s *= 2.0;
+    e -= 1;
+    if e < min_exp {
+        s *= fast_pow2(e - min_exp);
+        e = min_exp;
+    }
+    if s == 0.0 { return (0.0, -126); }
+    (s, e)
+}
+
+/// f64 fused_sum mirroring oracle arithmetic.py:115-129.
+#[inline]
+fn fused_sum_f64(sigs: &[f64], exps: &[i32], nfb: i32) -> (f64, i32) {
+    let max_e = *exps.iter().max().unwrap();
+    let mut acc = 0.0f64;
+    for i in 0..sigs.len() {
+        let shift = nfb + exps[i] - max_e;
+        let scaled = sigs[i] * fast_pow2(shift);
+        acc += scaled.trunc();
+    }
+    (acc * fast_pow2(-nfb), max_e)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_mxfp4_k64(
+    a_packed: &[u8],           // (m, k/2) = (16, 32) for k=64
+    b_packed: &[u8],           // (k/2, n) = (32, 8)
+    c: &[f32],                 // (m, n)
+    scale_a_exp: &[i32],       // (m, k/block_size)
+    scale_b_exp: &[i32],       // (k/block_size, n)
+    m: usize, n: usize, k: usize,
+    block_size: usize,
+    nfb: i32,
+    out_mantissa_bits: i32,
+    out: &mut [f32],
+) {
+    // Unpack A, B to f32. k=64, so m*k = 1024, k*n = 512.
+    let mut a_f32 = [0f32; 1024];
+    let mut b_f32 = [0f32; 512];
+    for i in 0..m {
+        for p in 0..k / 2 {
+            let (lo, hi) = unpack_fp4_byte(a_packed[i * (k / 2) + p]);
+            a_f32[i * k + 2 * p]     = lo;
+            a_f32[i * k + 2 * p + 1] = hi;
+        }
+    }
+    for p in 0..k / 2 {
+        for j in 0..n {
+            let (lo, hi) = unpack_fp4_byte(b_packed[p * n + j]);
+            // B layout: b_packed[p, j] packs (b[2p, j], b[2p+1, j])
+            b_f32[2 * p * n + j]       = lo;
+            b_f32[(2 * p + 1) * n + j] = hi;
+        }
+    }
+
+    let scales_per_row = k / block_size;
+    let step = 16usize; // oracle iterates blocks of 16 regardless of block_size
+
+    for i in 0..m {
+        for j in 0..n {
+            let c_val = c[i * n + j] as f64;
+            if c_val.is_nan() {
+                out[i * n + j] = f32::from_bits(0x7FFF_FFFF);
+                continue;
+            }
+            let (c_sig, c_exp) = extract_sig_exp_f64(c_val, -126);
+
+            // Per-16-element-block term collection.
+            let n_blocks = k / step;
+            // n_blocks can be up to 4 for k=64.
+            let mut sigs = [0.0f64; 16]; // over-provisioned
+            let mut exps = [0i32; 16];
+            sigs[0] = c_sig;
+            exps[0] = c_exp;
+            let mut n_terms = 1usize;
+
+            let mut had_nan_inf = false;
+            for b in 0..n_blocks {
+                let k_start = b * step;
+                let mut block_sum = 0.0f64;
+                for l in 0..step {
+                    let idx = k_start + l;
+                    block_sum += (a_f32[i * k + idx] as f64)
+                               * (b_f32[idx * n + j] as f64);
+                }
+                if !block_sum.is_finite() {
+                    had_nan_inf = true;
+                    break;
+                }
+                let scale_idx = (b * step) / block_size;
+                let sae = scale_a_exp[i * scales_per_row + scale_idx];
+                let sbe = scale_b_exp[scale_idx * n + j];
+                sigs[n_terms] = block_sum;
+                exps[n_terms] = sae + sbe;
+                n_terms += 1;
+            }
+
+            if had_nan_inf {
+                // Let fused_sum path handle via f64 semantics; simpler:
+                // recompute products flat and let f64 produce Inf/NaN.
+                let mut s = c_val;
+                for idx in 0..k {
+                    s += (a_f32[i * k + idx] as f64) * (b_f32[idx * n + j] as f64);
+                }
+                if s.is_nan() {
+                    out[i * n + j] = f32::from_bits(0x7FFF_FFFF);
+                } else {
+                    out[i * n + j] = s as f32;
+                }
+                continue;
+            }
+
+            let (sum_val, max_e) = fused_sum_f64(
+                &sigs[..n_terms], &exps[..n_terms], nfb,
+            );
+            // sum_val already incorporates the 2^-nfb factor; just apply 2^max_e.
+            let result_f64 = sum_val * fast_pow2(max_e);
+            out[i * n + j] = normalize_f32(result_f64, out_mantissa_bits);
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, scale_a, scale_b, nfb, block_size, out_mantissa_bits))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_mxfp4_k64_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, u8>,         // (batch, m, k/2)
+    b: PyReadonlyArray3<'py, u8>,         // (batch, k/2, n)
+    c: PyReadonlyArray3<'py, f32>,        // (batch, m, n)
+    scale_a: PyReadonlyArray3<'py, f32>,  // (batch, m, k/block_size)
+    scale_b: PyReadonlyArray3<'py, f32>,  // (batch, k/block_size, n)
+    nfb: i32,
+    block_size: usize,
+    out_mantissa_bits: i32,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let sa_v = scale_a.as_array();
+    let sb_v = scale_b.as_array();
+
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k_half = a_v.shape()[2]; // k / 2
+    let k = k_half * 2;
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k_half, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+    let nsc = k / block_size;
+    assert_eq!(sa_v.shape(), &[batch, m, nsc]);
+    assert_eq!(sb_v.shape(), &[batch, nsc, n]);
+
+    let sa_flat: Vec<f32> = sa_v.iter().copied().collect();
+    let sb_flat: Vec<f32> = sb_v.iter().copied().collect();
+    let scale_a_exp: Vec<i32> = sa_flat.iter().map(|&v| extract_pow2_exp(v)).collect();
+    let scale_b_exp: Vec<i32> = sb_flat.iter().map(|&v| extract_pow2_exp(v)).collect();
+
+    let a_owned: Vec<u8>;
+    let a_slice: &[u8] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<u8>;
+    let b_slice: &[u8] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0f32; batch * m * n];
+    let a_stride = m * k_half;
+    let b_stride = k_half * n;
+    let c_stride = m * n;
+    let sa_stride = m * nsc;
+    let sb_stride = nsc * n;
+
+    py.allow_threads(|| {
+        (0..batch).into_par_iter()
+            .zip(out.par_chunks_mut(c_stride))
+            .for_each(|(bi, out_i)| {
+                let a_i = &a_slice[bi * a_stride..(bi + 1) * a_stride];
+                let b_i = &b_slice[bi * b_stride..(bi + 1) * b_stride];
+                let c_i = &c_slice[bi * c_stride..(bi + 1) * c_stride];
+                let sa_i = &scale_a_exp[bi * sa_stride..(bi + 1) * sa_stride];
+                let sb_i = &scale_b_exp[bi * sb_stride..(bi + 1) * sb_stride];
+                run_one_tile_mxfp4_k64(
+                    a_i, b_i, c_i, sa_i, sb_i,
+                    m, n, k, block_size,
+                    nfb, out_mantissa_bits, out_i,
                 );
             });
     });

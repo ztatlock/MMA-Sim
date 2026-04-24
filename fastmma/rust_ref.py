@@ -59,7 +59,10 @@ _SUPPORTED_BLOCK_SCALE: set[tuple[str, str]] = {
     ("RTX Blackwell", "m16n8k32.block32.f32.e5m2.e4m3.f32.ue8m0"),
     ("RTX Blackwell", "m16n8k32.block32.f32.e4m3.e5m2.f32.ue8m0"),
     ("RTX Blackwell", "m16n8k32.block32.f32.e4m3.e4m3.f32.ue8m0"),
-    # mxfp4 (k=64) and ue4m3 scale variants come later (M1d).
+    # RTX Blackwell mxf4nvf4 (k=64, per-block ue8m0 scale). Phase M1d.
+    ("RTX Blackwell", "m16n8k64.block32.f32.e2m1.e2m1.f32.ue8m0"),
+    ("RTX Blackwell", "m16n8k64.block16.f32.e2m1.e2m1.f32.ue8m0"),
+    # ue4m3 scale variants not yet supported (non-power-of-2 scales).
 }
 
 
@@ -322,8 +325,10 @@ class mma_block_scale:
             )
 
         self._out_mant_bits = 13 if self.output_type == "f32_e8m13" else 23
-        self._a_min = _MIN_EXP[self.a_type]
-        self._b_min = _MIN_EXP[self.b_type]
+        # For mxfp4 (a_type=uint8 packed), decompose doesn't happen on A/B
+        # directly so a_min / b_min are unused.
+        self._a_min = _MIN_EXP.get(self.a_type, 0)
+        self._b_min = _MIN_EXP.get(self.b_type, 0)
         self._c_min = _MIN_EXP[self.c_type]
 
     @staticmethod
@@ -358,10 +363,16 @@ class mma_block_scale:
         scale_A: torch.Tensor,
         scale_B: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched: A=(B, m, k), B=(B, k, n), C=(B, m, n),
-        scale_A=(B, m, k/block_size), scale_B=(B, k/block_size, n)."""
-        # For k=32, scale_A shape is (B, m, 1) and scale_B is (B, 1, n).
-        assert self.k == 32, "only k=32 supported in M1c"
+        """Batched: shapes as per the oracle."""
+        if self.k == 32:
+            return self._call_batched_k32(A, B, C, scale_A, scale_B)
+        elif self.k == 64:
+            return self._call_batched_mxfp4(A, B, C, scale_A, scale_B)
+        else:
+            raise NotImplementedError(f"k={self.k} not supported")
+
+    def _call_batched_k32(self, A, B, C, scale_A, scale_B):
+        # A=(B, m, k), B=(B, k, n), scales are per-tile (shape (B, m, 1) / (B, 1, n)).
         assert A.shape[1:] == (self.m, self.k)
         assert B.shape[1:] == (self.k, self.n)
         assert C.shape[1:] == (self.m, self.n)
@@ -379,5 +390,28 @@ class mma_block_scale:
             self.nfb,
             self._a_min, self._b_min, self._c_min,
             self._out_mant_bits,
+        )
+        return torch.from_numpy(out)
+
+    def _call_batched_mxfp4(self, A, B, C, scale_A, scale_B):
+        # A, B are u8-packed fp4: shapes (B, m, k/2), (B, k/2, n).
+        # Scales shape: (B, m, k/block_size), (B, k/block_size, n).
+        half_k = self.k // 2
+        n_sc = self.k // self.block_size
+        assert A.shape[1:] == (self.m, half_k)
+        assert B.shape[1:] == (half_k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
+        assert scale_A.shape[1:] == (self.m, n_sc)
+        assert scale_B.shape[1:] == (n_sc, self.n)
+
+        A_u8 = np.ascontiguousarray(A.detach().cpu().numpy(), dtype=np.uint8)
+        B_u8 = np.ascontiguousarray(B.detach().cpu().numpy(), dtype=np.uint8)
+        C_f32 = self._as_f32(C)
+        sA_f32 = self._as_f32(scale_A)
+        sB_f32 = self._as_f32(scale_B)
+
+        out = _rs.mma_f32_out_mxfp4_k64_rayon(
+            A_u8, B_u8, C_f32, sA_f32, sB_f32,
+            self.nfb, int(self.block_size), self._out_mant_bits,
         )
         return torch.from_numpy(out)

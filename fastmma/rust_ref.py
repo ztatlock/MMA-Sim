@@ -207,6 +207,26 @@ class mma:
         ("Volta",  "m8n8k4.f32.f16.f16.f32"):     "mma_spec_volta_f16",
     }
 
+    def call_batched_metal(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        """Metal GPU kernel. Currently only Ampere m16n8k16.f32.f16.f16.f32."""
+        if (self.arch, self.qualifier) != ("Ampere", "m16n8k16.f32.f16.f16.f32"):
+            raise NotImplementedError(
+                "Metal backend only has ampere-f16 for now"
+            )
+        if not hasattr(_rs, "mma_metal_ampere_f16"):
+            raise NotImplementedError("Metal backend not built (not macOS?)")
+        assert A.shape[1:] == (16, 16)
+        assert B.shape[1:] == (16, 8)
+        assert C.shape[1:] == (16, 8)
+        A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
+        out = _rs.mma_metal_ampere_f16(A_f32, B_f32, C_f32)
+        return torch.from_numpy(out)
+
     def call_batched_specialized(
         self,
         A: torch.Tensor,

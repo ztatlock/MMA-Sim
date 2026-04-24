@@ -15,6 +15,10 @@ ndarray = "0.16"
 libm = "0.2"
 rayon = "1.10"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

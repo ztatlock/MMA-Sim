@@ -15,6 +15,9 @@ use numpy::{IntoPyArray, PyArray2, PyArray3, PyReadonlyArray2, PyReadonlyArray3}
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+#[cfg(target_os = "macos")]
+mod metal_ampere_f16;
+
 const F32_MIN_EXP: i32 = -126;
 
 /// Decompose an f32 value to (signed int_sig at scale 2^nfb, exp) with
@@ -1313,7 +1316,51 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_ampere_tf32, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_turing_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
+    #[cfg(target_os = "macos")]
+    m.add_function(wrap_pyfunction!(mma_metal_ampere_f16, &m)?)?;
     Ok(())
+}
+
+/// Phase 4 — Metal GPU backend for ampere-f16 workhorse.
+#[cfg(target_os = "macos")]
+#[pyfunction]
+fn mma_metal_ampere_f16<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    assert_eq!(a_v.shape(), &[batch, 16, 16]);
+    assert_eq!(b_v.shape(), &[batch, 16, 8]);
+    assert_eq!(c_v.shape(), &[batch, 16, 8]);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let out = py.allow_threads(|| {
+        metal_ampere_f16::run_batched(a_slice, b_slice, c_slice, batch)
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, 16, 8), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
 }
 
 // Keep guarded_shl reachable for future block-scale paths and silence dead-code

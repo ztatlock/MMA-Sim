@@ -1329,6 +1329,7 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_turing_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_fma_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_mxfp4_k64_rayon, &m)?)?;
     #[cfg(target_os = "macos")]
@@ -1794,6 +1795,80 @@ fn run_one_tile_f64(
             out[i * n + j] = sum;
         }
     }
+}
+
+/// AMD f32 fma kernel. Mirrors mmasim/simulator/amd.py `operation_type == "fma"`
+/// path for f32 operands: `sum = fma(a, b, sum)` across k per output.
+/// Uses `f32::mul_add` which compiles to native f32 FMA on aarch64/x86.
+#[inline]
+fn run_one_tile_f32_fma(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    out: &mut [f32],
+) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = c[i * n + j];
+            for l in 0..k {
+                sum = a[i * k + l].mul_add(b[l * n + j], sum);
+            }
+            out[i * n + j] = sum;
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c))]
+fn mma_f32_fma_batched_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((o, a), b), c)| {
+                run_one_tile_f32_fma(a, b, c, m, n, k, o);
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
 }
 
 #[pyfunction]

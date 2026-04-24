@@ -68,7 +68,11 @@ def main() -> None:
         spec = bundle["spec"]
 
         # Build the impl op.
-        ctor_name = {"mma": "mma", "mma_block_scale": "mma_block_scale"}[spec["kind"]]
+        ctor_name = {
+            "mma": "mma",
+            "mma_block_scale": "mma_block_scale",
+            "mfma": "mfma",
+        }[spec["kind"]]
         ctor = getattr(impl_mod, ctor_name, None)
         if ctor is None:
             print(f"{label:22s} {'SKIP':>6s}  (impl has no {ctor_name})")
@@ -118,7 +122,12 @@ def main() -> None:
         # We need the oracle's timing for speedup. Run it once more here.
         from mmasim.simulator.nv_ptx import mma as _oracle_mma
         from mmasim.simulator.nv_ptx import mma_block_scale as _oracle_mbs
-        oracle_ctor = _oracle_mma if spec["kind"] == "mma" else _oracle_mbs
+        from mmasim.simulator.amd import mfma as _oracle_mfma
+        oracle_ctor = {
+            "mma": _oracle_mma,
+            "mma_block_scale": _oracle_mbs,
+            "mfma": _oracle_mfma,
+        }[spec["kind"]]
         oracle = oracle_ctor(spec["arch"], spec["qualifier"])
 
         def _run_oracle():

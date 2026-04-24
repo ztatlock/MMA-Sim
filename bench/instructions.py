@@ -16,6 +16,7 @@ from . import _compat  # noqa: F401  (side effect: libm shim)
 import torch
 
 from mmasim.simulator.nv_ptx import mma, mma_block_scale
+from mmasim.simulator.amd import mfma
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,12 @@ REGISTRY: list[InstSpec] = [
              "m16n8k32.block32.f32.e4m3.e4m3.f32.ue8m0"),
     InstSpec("blackwell-mxfp4", "mma_block_scale", "RTX Blackwell",
              "m16n8k64.block32.f32.e2m1.e2m1.f32.ue8m0"),
+    # AMD MFMA — phase M3. Scope: the `fma` operation_type paths (f64
+    # everywhere, f32 non-xf32 on all CDNA). Pairwise / fused_dot_rd_add
+    # paths are deferred.
+    InstSpec("amd-cdna2-f64",    "mfma", "CDNA2", "f64_16x16x4f64"),
+    InstSpec("amd-cdna3-f64",    "mfma", "CDNA3", "f64_16x16x4_f64"),
+    InstSpec("amd-cdna3-f32",    "mfma", "CDNA3", "f32_32x32x2_f32"),
 ]
 
 
@@ -50,6 +57,8 @@ def make(spec: InstSpec) -> Any:
         return mma(spec.arch, spec.qualifier)
     if spec.kind == "mma_block_scale":
         return mma_block_scale(spec.arch, spec.qualifier)
+    if spec.kind == "mfma":
+        return mfma(spec.arch, spec.qualifier)
     raise ValueError(f"unknown kind: {spec.kind}")
 
 

@@ -44,12 +44,44 @@ _SUPPORTED: set[tuple[str, str]] = {
 
 # Mirrors mmasim/simulator/arithmetic.py::dtype_min_exponent.
 _MIN_EXP = {
-    torch.float64:       -1022,
-    torch.float32:       -126,
-    torch.float16:       -14,
-    torch.bfloat16:      -126,
-    torch.float8_e4m3fn: -6,
-    torch.float8_e5m2:   -14,
+    torch.float64:         -1022,
+    torch.float32:         -126,
+    torch.float16:         -14,
+    torch.bfloat16:        -126,
+    torch.float8_e4m3fn:   -6,
+    torch.float8_e5m2:     -14,
+    torch.float8_e4m3fnuz: -7,
+    torch.float8_e5m2fnuz: -15,
+}
+
+
+# AMD MFMA operation_type → supported kernel mapping (phase M3).
+# Only `fma` path supported today; `pairwise` and `fused_dot_rd_add`
+# are deferred.
+_SUPPORTED_MFMA: set[tuple[str, str]] = {
+    # CDNA2 f64 (operation_type = fma)
+    ("CDNA2", "f64_16x16x4f64"),
+    ("CDNA2", "f64_4x4x4f64"),
+    # CDNA3 f64 (operation_type = fma)
+    ("CDNA3", "f64_16x16x4_f64"),
+    ("CDNA3", "f64_4x4x4_4b_f64"),
+    # CDNA3 f32 non-xf32 (operation_type = fma)
+    ("CDNA3", "f32_32x32x1_2b_f32"),
+    ("CDNA3", "f32_16x16x1_4b_f32"),
+    ("CDNA3", "f32_4x4x1_16b_f32"),
+    ("CDNA3", "f32_32x32x2_f32"),
+    ("CDNA3", "f32_16x16x4_f32"),
+    # CDNA1/2 f32 (reused from cdna1 list)
+    ("CDNA1", "f32_32x32x2f32"),
+    ("CDNA1", "f32_32x32x1f32"),
+    ("CDNA1", "f32_16x16x4f32"),
+    ("CDNA1", "f32_16x16x1f32"),
+    ("CDNA1", "f32_4x4x1f32"),
+    ("CDNA2", "f32_32x32x2f32"),
+    ("CDNA2", "f32_32x32x1f32"),
+    ("CDNA2", "f32_16x16x4f32"),
+    ("CDNA2", "f32_16x16x1f32"),
+    ("CDNA2", "f32_4x4x1f32"),
 }
 
 
@@ -293,6 +325,55 @@ class mma:
         A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
         out = getattr(_rs, fn_name)(A_f32, B_f32, C_f32)
         return torch.from_numpy(out)
+
+
+class mfma:
+    """AMD MFMA reimplementation (Phase M3, narrow scope).
+
+    Currently supports only `fma` operation_type paths — f64 everywhere,
+    f32 non-xf32 on all CDNA generations. Pairwise (CDNA1/2 f16/bf16)
+    and fused_dot_rd_add (CDNA3 f16/bf16/fp8 + all xf32) paths raise
+    NotImplementedError.
+    """
+
+    def __init__(self, arch: str, qualifier: str):
+        from mmasim.simulator.amd import mfma as _oracle_mfma
+        _ref = _oracle_mfma(arch, qualifier)
+        self.arch = arch
+        self.qualifier = qualifier
+        self.m, self.n, self.k = _ref.m, _ref.n, _ref.k
+        self.a_type = _ref.a_type
+        self.b_type = _ref.b_type
+        self.c_type = _ref.c_type
+        self.d_type = _ref.d_type
+        self.operation_type = _ref.operation_type
+
+        if (arch, qualifier) not in _SUPPORTED_MFMA:
+            raise NotImplementedError(
+                f"rust_ref.mfma: not yet supported: ({arch!r}, {qualifier!r}) "
+                f"[operation_type={self.operation_type}]"
+            )
+
+    def __call__(
+        self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+    ) -> torch.Tensor:
+        assert A.shape == (self.m, self.k)
+        assert B.shape == (self.k, self.n)
+        assert C.shape == (self.m, self.n)
+        if self.d_type is torch.float64:
+            A64 = np.ascontiguousarray(A.detach().cpu().numpy(), dtype=np.float64)
+            B64 = np.ascontiguousarray(B.detach().cpu().numpy(), dtype=np.float64)
+            C64 = np.ascontiguousarray(C.detach().cpu().numpy(), dtype=np.float64)
+            out = _rs.mma_f64_batched_rayon(A64[None], B64[None], C64[None])
+            return torch.from_numpy(out[0])
+        elif self.d_type is torch.float32:
+            A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+            out = _rs.mma_f32_fma_batched_rayon(A32[None], B32[None], C32[None])
+            return torch.from_numpy(out[0])
+        else:
+            raise NotImplementedError(f"mfma d_type {self.d_type} not implemented")
 
 
 class mma_block_scale:

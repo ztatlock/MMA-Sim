@@ -9,20 +9,23 @@ A drop-in replacement for `mmasim` that produces **bit-identical** outputs
 across every supported (arch, instruction, dtype) combination, fast
 enough for realistic-scale simulations (millions of tiles).
 
-## Status (2026-04-23, after Branch A)
+## Status (2026-04-24, after coverage gaps closed)
 
 **Perf:** ampere-f16 workhorse specialized at 0.581 μs/tile (16 180×).
 Metal GPU port works bit-exact but doesn't beat CPU at tested sizes.
 
-**Coverage:** **13 instruction types, 32 bit-exact fixtures** (random +
-edge corpora). Covers NVIDIA `mma` (Volta→Blackwell), `mma_block_scale`
-(Blackwell mxfp8/mxfp4), `wgmma` (Hopper f32-output), AMD `mfma`
-(fma operation_type). Still missing: f16-output (RNE), AMD pairwise /
-fused_dot_rd_add paths, tcgen05mma, wider wgmma n (>64).
+**Coverage:** **26+ instruction types, 68 bit-exact fixtures**. Covers
+every elementary operation from the paper's Table 1: Φ_FMA, Φ_FTZ-AddMul,
+Φ_E-FDPA, Φ_T-FDPA, Φ_ST-FDPA, Φ_GST-FDPA, Φ_TR-FDPA, Φ_GTR-FDPA.
+Spans NVIDIA `mma` (Volta→Blackwell, f32 and f16 outputs), `wgmma`
+(Hopper, up to m64n256), `tcgen05mma` (Blackwell, m∈{64,128}),
+`mma_block_scale` (mxfp8 k=32 and mxfp4 k=64), and AMD `mfma` (fma,
+pairwise, and fused_dot_rd_add paths for CDNA1/2/3).
 
-**Validation:** corpus-based, 5 RNG seeds × ~10 samples × 13
-instructions = ~200 curated validation points. Not yet validated
-against real GPU silicon.
+**Validation:** the Python oracle is silicon-validated upstream
+(per arXiv:2511.10909; ~1M tests per instruction × 10 real GPUs).
+Our 68 fixtures verify fastmma.rust_ref is bit-exact against the
+oracle. Chain of trust documented in [docs/validation.md](docs/validation.md).
 
 ## Guiding principles (unchanged)
 
@@ -77,24 +80,22 @@ These aren't exclusive, but they serve different goals. Priorities
 below reflect the user's stated goal: *trustworthy, reliable,
 bit-accurate simulation at scale*.
 
-### Branch A — Coverage (largely COMPLETE; remainders below)
+### Branch A — Coverage (COMPLETE)
 
-Everything tractable without new algorithm work landed in milestones
-M1a–M4 (commits d8eef34..38c6d0f). What remains:
+All major gaps closed in milestones M1a–M4 (commits d8eef34..38c6d0f)
+and N1–N4 (commits 7823561..1c6bdb3). Write-ups:
+  - [logs/2026-04-23-branch-A-coverage.md](logs/2026-04-23-branch-A-coverage.md) (M-series)
+  - [logs/2026-04-24-coverage-gaps-closed.md](logs/2026-04-24-coverage-gaps-closed.md) (N-series)
 
-1. **f16-output variants.** Oracle uses RNE for f16 output; our
-   normalize uses RZ. Needed for: wgmma f16-output, Ada fp8 f16-output
-   (16 qualifiers), Blackwell f8f6f4 f16-output. ~½ day to add an
-   `normalize_f16_rne` path.
-2. **AMD pairwise + fused_dot_rd_add paths.** Covers CDNA1/2 f16/bf16
-   (pairwise) and CDNA3 xf32/f16/bf16/fp8 (fused_dot_rd_add with RD
-   rounding). ~1 day. RD rounding is the non-trivial piece.
-3. **tcgen05mma.** Collective Blackwell matmul; math identical to
-   wgmma per-tile (same `nv_fused_dot_add`). ~30 min plumbing.
-4. **Wider wgmma n.** Tested n=64, ISA supports n up to 256. Kernel
-   should already handle; register qualifiers. ~30 min.
+All 8 elementary operations from the paper's Table 1 are implemented.
+Any instruction whose oracle model is a composition of these can now
+dispatch through `fastmma.rust_ref`.
 
-**Estimated remaining effort:** ~2 days, no algorithmic novelty.
+**Residual narrow gaps** (not blocking correctness for what we cover):
+- f16-output for large wgmma/tcgen05mma tiles (~1 hr plumbing).
+- tcgen05mma_block_scale (different API, same math; ~2 hr).
+- mxfp4 with ue4m3 scales (non-power-of-2; needs scale-sig handling).
+- fp6 e3m2/e2m3 (upstream oracle marks these "TODO" too).
 
 ### Branch B — Validation against real silicon (priority: high)
 

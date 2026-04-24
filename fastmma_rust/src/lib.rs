@@ -816,64 +816,67 @@ fn mma_f32_out_batched_rayon<'py>(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Phase 3.0 — hand-specialized ampere-f16 kernel.
+// Phase 3.0 / 3.1 — specialized kernels.
 //
-// All constants baked in for the specific instruction
-// `m16n8k16.f32.f16.f16.f32` on Ampere: M=16, N=8, K=16 (split into two
-// K_HALF=8 passes), nfb=24, f16 inputs (no f32 subnormal path needed),
-// f32 output with RZ to 23 mantissa bits. k-loop fully unrolled by the
-// compiler at K_HALF=8. Goal: measure the CPU ceiling for this tile.
+// Phase 3.0 hand-wrote one kernel for ampere-f16. Phase 3.1 generalizes:
+// one const-generic `step_narrow<const M, N, K, NFB, A_MIN, B_MIN>` and
+// one `step_f32<const M, N, K, NFB>` covering the five supported tile
+// types. Every supported (arch, qualifier) gets its own monomorphization
+// via a dedicated PyO3 entry.
+//
+// Kept as `ampere_f16` initially for compatibility with the Phase 3.0
+// entry name — renamed to `specialized` in 3.1.
 // ─────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
-mod ampere_f16 {
+mod specialized {
     use core::arch::aarch64::*;
 
     use super::{fast_pow2, normalize_f32};
 
-    const M: usize = 16;
-    const N: usize = 8;
-    const K_HALF: usize = 8;
-    const NFB: i32 = 24;
+    /// Stack buffer cap for pre-decomposed operands. Covers up to
+    /// M*K = 16*16 = 256 for our current tile set.
+    pub(super) const MAX: usize = 256;
 
-    /// Decompose an f32 that holds an exact f16 value. f16→f32 never
-    /// produces an f32 subnormal (f16 subnormals widen to f32 normals),
-    /// so we skip that branch entirely. For NaN/Inf inputs the returned
-    /// int_sig is garbage — caller bypasses the integer path via the
-    /// f64 NaN/Inf pre-check.
+    /// Decompose an f32 that holds a narrow value (f16 or bf16 cast up).
+    /// Neither source type can produce an f32 subnormal via cast, so we
+    /// skip that branch. MIN_EXP is the target dtype's flush cutoff: -14
+    /// for f16, -126 for bf16. NFB is the accumulator fractional-bit
+    /// count (typically 23 or 24); int_sig is returned at scale 2^NFB.
+    /// NaN/Inf → garbage int (fp64 check catches).
     #[inline(always)]
-    fn decompose_f16(v: f32) -> (i64, i32) {
+    fn decompose_narrow<const MIN_EXP: i32, const NFB: i32>(v: f32) -> (i64, i32) {
         let bits = v.to_bits();
         let sign = (bits >> 31) & 1 != 0;
         let biased_e = ((bits >> 23) & 0xFF) as i32;
         let mant = (bits & 0x7F_FFFF) as i64;
-
         if biased_e == 0 {
-            return (0, -126); // zero quirk (f16 zero -> f32 zero, mant=0 assured)
+            return (0, -126); // zero quirk
         }
-        // Normal path (includes nan/inf as "garbage int"; fp64 check handles).
-        let sig_q24 = ((1i64 << 23) + mant) << 1; // scale to 2^24
+        // Scale to 2^NFB. NFB >= 23 for supported ISA/arch combos; shift up
+        // by NFB-23 from the native f32 mantissa scale (2^23).
+        let sig_qnfb = ((1i64 << 23) + mant) << (NFB - 23);
         let exp = biased_e - 127;
-        let (int_sig, final_exp) = if exp < -14 {
-            let shift = (-14 - exp) as u32;
-            let shifted = sig_q24 >> shift;
-            if shifted == 0 { (0, -126) } else { (shifted, -14) }
+        let (int_sig, final_exp) = if exp < MIN_EXP {
+            let shift = (MIN_EXP - exp) as u32;
+            let s = sig_qnfb >> shift;
+            if s == 0 { (0, -126) } else { (s, MIN_EXP) }
         } else {
-            (sig_q24, exp)
+            (sig_qnfb, exp)
         };
         let signed = if sign { -int_sig } else { int_sig };
         (signed, final_exp)
     }
 
-    /// Decompose a general f32 (for the C addend and the mid-pass C from
-    /// the first half of split-K).
+    /// Decompose a general f32 (tf32 inputs and the C addend). Handles
+    /// f32 subnormals via leading-zero normalization. NFB parameterizes
+    /// the accumulator scale.
     #[inline(always)]
-    fn decompose_f32(v: f32) -> (i64, i32) {
+    fn decompose_f32_src<const NFB: i32>(v: f32) -> (i64, i32) {
         let bits = v.to_bits();
         let sign = (bits >> 31) & 1 != 0;
         let biased_e = ((bits >> 23) & 0xFF) as i32;
         let mant = (bits & 0x7F_FFFF) as i64;
-
         if biased_e == 0 && mant == 0 {
             return (0, -126);
         }
@@ -883,7 +886,7 @@ mod ampere_f16 {
         } else {
             ((1i64 << 23) + mant, biased_e - 127)
         };
-        let mut int_sig = sig_q23 << 1;
+        let mut int_sig = sig_q23 << (NFB - 23);
         let mut exp = exp;
         if exp < -126 {
             let shift = (-126 - exp) as u32;
@@ -909,51 +912,40 @@ mod ampere_f16 {
         vld1q_s64(arr.as_ptr())
     }
 
-    /// One split-K half: A (16, 8) × B (8, 8) + C (16, 8) -> out (16, 8).
+    /// Per-output inner kernel. Operates on already-decomposed (sig, exp)
+    /// buffers plus the raw f32 arrays for the NaN/Inf pre-check. All
+    /// loop bounds are const-generic so the compiler fully unrolls k.
     #[target_feature(enable = "neon")]
-    unsafe fn step(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
-        // Pre-decompose. Tight exact-sized buffers.
-        let mut a_sig = [0i64; M * K_HALF];
-        let mut a_exp = [0i32; M * K_HALF];
-        for i in 0..M * K_HALF {
-            let (s, e) = decompose_f16(a[i]);
-            a_sig[i] = s;
-            a_exp[i] = e;
-        }
-        let mut b_sig = [0i64; K_HALF * N];
-        let mut b_exp = [0i32; K_HALF * N];
-        for i in 0..K_HALF * N {
-            let (s, e) = decompose_f16(b[i]);
-            b_sig[i] = s;
-            b_exp[i] = e;
-        }
-
+    unsafe fn inner<const M: usize, const N: usize, const K: usize, const NFB: i32>(
+        a_sig: &[i64; MAX], a_exp: &[i32; MAX],
+        b_sig: &[i64; MAX], b_exp: &[i32; MAX],
+        a: &[f32], b: &[f32], c: &[f32], out: &mut [f32],
+    ) {
         for i in 0..M {
             let mut jp = 0;
             while jp + 1 < N {
-                let (c0_sig, c0_exp) = decompose_f32(c[i * N + jp]);
-                let (c1_sig, c1_exp) = decompose_f32(c[i * N + jp + 1]);
+                let (c0_sig, c0_exp) = decompose_f32_src::<NFB>(c[i * N + jp]);
+                let (c1_sig, c1_exp) = decompose_f32_src::<NFB>(c[i * N + jp + 1]);
 
                 let mut fp0 = c[i * N + jp] as f64;
                 let mut fp1 = c[i * N + jp + 1] as f64;
 
-                let mut ps0 = [0i64; K_HALF];
-                let mut ps1 = [0i64; K_HALF];
-                let mut pe0 = [0i32; K_HALF];
-                let mut pe1 = [0i32; K_HALF];
+                let mut ps0 = [0i64; 128];
+                let mut ps1 = [0i64; 128];
+                let mut pe0 = [0i32; 128];
+                let mut pe1 = [0i32; 128];
                 let mut max_e0 = c0_exp;
                 let mut max_e1 = c1_exp;
 
-                // K_HALF = 8 fully unrolled by the compiler.
-                for l in 0..K_HALF {
-                    let a_s = a_sig[i * K_HALF + l];
-                    let a_e = a_exp[i * K_HALF + l];
+                for l in 0..K {
+                    let a_s = a_sig[i * K + l];
+                    let a_e = a_exp[i * K + l];
                     let b_s0 = b_sig[l * N + jp];
                     let b_s1 = b_sig[l * N + jp + 1];
                     let b_e0 = b_exp[l * N + jp];
                     let b_e1 = b_exp[l * N + jp + 1];
-                    fp0 += (a[i * K_HALF + l] as f64) * (b[l * N + jp] as f64);
-                    fp1 += (a[i * K_HALF + l] as f64) * (b[l * N + jp + 1] as f64);
+                    fp0 += (a[i * K + l] as f64) * (b[l * N + jp] as f64);
+                    fp1 += (a[i * K + l] as f64) * (b[l * N + jp + 1] as f64);
                     ps0[l] = a_s * b_s0;
                     ps1[l] = a_s * b_s1;
                     let e0 = a_e + b_e0;
@@ -971,7 +963,7 @@ mod ampere_f16 {
                         pack2(c0_sig, c1_sig),
                         pack2((max_e0 - c0_exp) as i64, (max_e1 - c1_exp) as i64),
                     );
-                    for l in 0..K_HALF {
+                    for l in 0..K {
                         let sig_v = pack2(ps0[l], ps1[l]);
                         let shift_v = pack2(
                             (max_e0 - pe0[l] + NFB) as i64,
@@ -994,53 +986,81 @@ mod ampere_f16 {
         }
     }
 
-    /// Full tile: two split-K halves.
-    pub(super) fn tile(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
-        // Slice out contiguous halves along the K axis of A.
-        let mut a1 = [0f32; M * K_HALF];
-        let mut a2 = [0f32; M * K_HALF];
-        for i in 0..M {
-            a1[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16..i * 16 + 8]);
-            a2[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16 + 8..(i + 1) * 16]);
+    /// Step for narrow (f16/bf16) inputs. Non-split-K path; callers do
+    /// the split-K halving at the tile level.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn step_narrow<
+        const M: usize, const N: usize, const K: usize, const NFB: i32,
+        const A_MIN: i32, const B_MIN: i32,
+    >(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
+        let mut a_sig = [0i64; MAX];
+        let mut a_exp = [0i32; MAX];
+        for i in 0..M * K {
+            let (s, e) = decompose_narrow::<A_MIN, NFB>(a[i]);
+            a_sig[i] = s;
+            a_exp[i] = e;
         }
-        let mut mid = [0f32; M * N];
-        unsafe {
-            step(&a1, &b[..K_HALF * N], c, &mut mid);
-            step(&a2, &b[K_HALF * N..], &mid, out);
+        let mut b_sig = [0i64; MAX];
+        let mut b_exp = [0i32; MAX];
+        for i in 0..K * N {
+            let (s, e) = decompose_narrow::<B_MIN, NFB>(b[i]);
+            b_sig[i] = s;
+            b_exp[i] = e;
         }
+        inner::<M, N, K, NFB>(&a_sig, &a_exp, &b_sig, &b_exp, a, b, c, out);
+    }
+
+    /// Step for f32/tf32 inputs.
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn step_f32<
+        const M: usize, const N: usize, const K: usize, const NFB: i32,
+    >(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
+        let mut a_sig = [0i64; MAX];
+        let mut a_exp = [0i32; MAX];
+        for i in 0..M * K {
+            let (s, e) = decompose_f32_src::<NFB>(a[i]);
+            a_sig[i] = s;
+            a_exp[i] = e;
+        }
+        let mut b_sig = [0i64; MAX];
+        let mut b_exp = [0i32; MAX];
+        for i in 0..K * N {
+            let (s, e) = decompose_f32_src::<NFB>(b[i]);
+            b_sig[i] = s;
+            b_exp[i] = e;
+        }
+        inner::<M, N, K, NFB>(&a_sig, &a_exp, &b_sig, &b_exp, a, b, c, out);
     }
 }
 
-/// Fallback on non-aarch64: use the generic SIMD kernel (which
-/// itself falls back to scalar there).
 #[cfg(not(target_arch = "aarch64"))]
-mod ampere_f16 {
-    use super::*;
-    pub(super) fn tile(a: &[f32], b: &[f32], c: &[f32], out: &mut [f32]) {
-        const M: usize = 16;
-        const N: usize = 8;
-        const K: usize = 16;
-        run_one_tile_simd(
-            a, b, c, M, N, K,
-            24, -14, -14, -126, 23, true, out,
-        );
-    }
+mod specialized {
+    // Stub: no specialized NEON on non-aarch64. Callers fall back to the
+    // generic simd-rayon path from the PyO3 entries themselves.
+    pub(super) const MAX: usize = 256;
 }
 
-#[pyfunction]
-fn mma_ampere_f16_f32_batched_specialized<'py>(
+/// PyO3 wrapper for batched specialized calls. Takes a per-tile closure
+/// that runs one MMA; internals handle shape check, zero-copy input
+/// slicing, rayon-parallel dispatch, and output assembly.
+fn run_batched_specialized<'py, F>(
     py: Python<'py>,
     a: PyReadonlyArray3<'py, f32>,
     b: PyReadonlyArray3<'py, f32>,
     c: PyReadonlyArray3<'py, f32>,
-) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    expected_m: usize, expected_n: usize, expected_k: usize,
+    per_tile: F,
+) -> PyResult<Bound<'py, PyArray3<f32>>>
+where
+    F: Fn(&[f32], &[f32], &[f32], &mut [f32]) + Sync,
+{
     let a_v = a.as_array();
     let b_v = b.as_array();
     let c_v = c.as_array();
     let batch = a_v.shape()[0];
-    assert_eq!(a_v.shape(), &[batch, 16, 16]);
-    assert_eq!(b_v.shape(), &[batch, 16, 8]);
-    assert_eq!(c_v.shape(), &[batch, 16, 8]);
+    assert_eq!(a_v.shape(), &[batch, expected_m, expected_k]);
+    assert_eq!(b_v.shape(), &[batch, expected_k, expected_n]);
+    assert_eq!(c_v.shape(), &[batch, expected_m, expected_n]);
 
     let a_owned: Vec<f32>;
     let a_slice: &[f32] = match a_v.as_slice() {
@@ -1058,21 +1078,160 @@ fn mma_ampere_f16_f32_batched_specialized<'py>(
         None => { c_owned = c_v.iter().copied().collect(); &c_owned }
     };
 
-    let mut out = vec![0f32; batch * 16 * 8];
+    let a_stride = expected_m * expected_k;
+    let b_stride = expected_k * expected_n;
+    let c_stride = expected_m * expected_n;
+    let mut out = vec![0f32; batch * c_stride];
 
     py.allow_threads(|| {
-        out.par_chunks_mut(16 * 8)
-            .zip(a_slice.par_chunks(16 * 16))
-            .zip(b_slice.par_chunks(16 * 8))
-            .zip(c_slice.par_chunks(16 * 8))
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
             .for_each(|(((o, a), b), c)| {
-                ampere_f16::tile(a, b, c, o);
+                per_tile(a, b, c, o);
             });
     });
 
-    let arr = ndarray::Array3::from_shape_vec((batch, 16, 8), out)
+    let arr = ndarray::Array3::from_shape_vec((batch, expected_m, expected_n), out)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(arr.into_pyarray_bound(py))
+}
+
+// ─── Per-instruction PyO3 entries ────────────────────────────────────
+// Each binds the (M, N, K, NFB, A_MIN, B_MIN) constants, handles split-K
+// explicitly (where applicable), and dispatches to the specialized kernel.
+// On non-aarch64 we fall back to the scalar SIMD path via run_one_tile_simd.
+
+#[pyfunction]
+fn mma_spec_ampere_f16<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    // m16n8k16 f32.f16.f16.f32 — split-K.
+    run_batched_specialized(py, a, b, c, 16, 8, 16, |a, b, c, out| {
+        const M: usize = 16; const N: usize = 8; const K_HALF: usize = 8;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let mut a1 = [0f32; specialized::MAX];
+            let mut a2 = [0f32; specialized::MAX];
+            for i in 0..M {
+                a1[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16..i * 16 + 8]);
+                a2[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16 + 8..(i + 1) * 16]);
+            }
+            let mut mid = [0f32; specialized::MAX];
+            specialized::step_narrow::<M, N, K_HALF, 24, -14, -14>(
+                &a1[..M * K_HALF], &b[..K_HALF * N], c, &mut mid[..M * N],
+            );
+            specialized::step_narrow::<M, N, K_HALF, 24, -14, -14>(
+                &a2[..M * K_HALF], &b[K_HALF * N..], &mid[..M * N], out,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { run_one_tile_simd(a, b, c, M, N, 16, 24, -14, -14, -126, 23, true, out); }
+    })
+}
+
+#[pyfunction]
+fn mma_spec_ampere_bf16<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    // m16n8k16 f32.bf16.bf16.f32 — split-K, bf16 min_exp=-126.
+    run_batched_specialized(py, a, b, c, 16, 8, 16, |a, b, c, out| {
+        const M: usize = 16; const N: usize = 8; const K_HALF: usize = 8;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let mut a1 = [0f32; specialized::MAX];
+            let mut a2 = [0f32; specialized::MAX];
+            for i in 0..M {
+                a1[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16..i * 16 + 8]);
+                a2[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 16 + 8..(i + 1) * 16]);
+            }
+            let mut mid = [0f32; specialized::MAX];
+            specialized::step_narrow::<M, N, K_HALF, 24, -126, -126>(
+                &a1[..M * K_HALF], &b[..K_HALF * N], c, &mut mid[..M * N],
+            );
+            specialized::step_narrow::<M, N, K_HALF, 24, -126, -126>(
+                &a2[..M * K_HALF], &b[K_HALF * N..], &mid[..M * N], out,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { run_one_tile_simd(a, b, c, M, N, 16, 24, -126, -126, -126, 23, true, out); }
+    })
+}
+
+#[pyfunction]
+fn mma_spec_ampere_tf32<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    // m16n8k8 f32.tf32.tf32.f32 — SPLIT-K on Ampere (oracle sets
+    // is_split_k=True when k==8 && a_type==torch.float32). Two passes
+    // of K_HALF=4. f32 source (subnormal path live).
+    run_batched_specialized(py, a, b, c, 16, 8, 8, |a, b, c, out| {
+        const M: usize = 16; const N: usize = 8; const K_HALF: usize = 4;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let mut a1 = [0f32; specialized::MAX];
+            let mut a2 = [0f32; specialized::MAX];
+            for i in 0..M {
+                a1[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 8..i * 8 + 4]);
+                a2[i * K_HALF..(i + 1) * K_HALF].copy_from_slice(&a[i * 8 + 4..(i + 1) * 8]);
+            }
+            let mut mid = [0f32; specialized::MAX];
+            specialized::step_f32::<M, N, K_HALF, 24>(
+                &a1[..M * K_HALF], &b[..K_HALF * N], c, &mut mid[..M * N],
+            );
+            specialized::step_f32::<M, N, K_HALF, 24>(
+                &a2[..M * K_HALF], &b[K_HALF * N..], &mid[..M * N], out,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { run_one_tile_simd(a, b, c, 16, 8, 8, 24, -126, -126, -126, 23, true, out); }
+    })
+}
+
+#[pyfunction]
+fn mma_spec_turing_f16<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    // m16n8k8 f32.f16.f16.f32 — no split-K.
+    run_batched_specialized(py, a, b, c, 16, 8, 8, |a, b, c, out| {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            specialized::step_narrow::<16, 8, 8, 24, -14, -14>(a, b, c, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { run_one_tile_simd(a, b, c, 16, 8, 8, 24, -14, -14, -126, 23, false, out); }
+    })
+}
+
+#[pyfunction]
+fn mma_spec_volta_f16<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    // m8n8k4 f32.f16.f16.f32 — no split-K, NFB=23 (Volta).
+    run_batched_specialized(py, a, b, c, 8, 8, 4, |a, b, c, out| {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            specialized::step_narrow::<8, 8, 4, 23, -14, -14>(a, b, c, out);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { run_one_tile_simd(a, b, c, 8, 8, 4, 23, -14, -14, -126, 23, false, out); }
+    })
 }
 
 /// Phase 2.5: rayon + SIMD — parallel over the batch, NEON inner kernel.
@@ -1149,7 +1308,11 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_f32_out_batched_simd, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_batched_simd_rayon, &m)?)?;
-    m.add_function(wrap_pyfunction!(mma_ampere_f16_f32_batched_specialized, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_spec_ampere_f16, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_spec_ampere_bf16, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_spec_ampere_tf32, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_spec_turing_f16, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
     Ok(())
 }
 

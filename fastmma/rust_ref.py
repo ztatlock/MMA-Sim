@@ -196,24 +196,35 @@ class mma:
         )
         return torch.from_numpy(out)
 
+    # Phase 3.1: per-instruction specialized PyO3 entries. Dispatched by
+    # (arch, qualifier); each kernel has its shape and parameters baked
+    # in at compile time.
+    _SPECIALIZED_FNS = {
+        ("Ampere", "m16n8k16.f32.f16.f16.f32"):   "mma_spec_ampere_f16",
+        ("Ampere", "m16n8k16.f32.bf16.bf16.f32"): "mma_spec_ampere_bf16",
+        ("Ampere", "m16n8k8.f32.tf32.tf32.f32"):  "mma_spec_ampere_tf32",
+        ("Turing", "m16n8k8.f32.f16.f16.f32"):    "mma_spec_turing_f16",
+        ("Volta",  "m8n8k4.f32.f16.f16.f32"):     "mma_spec_volta_f16",
+    }
+
     def call_batched_specialized(
         self,
         A: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
     ) -> torch.Tensor:
-        """Phase 3.0 hand-specialized kernel. Currently only
-        (Ampere, m16n8k16.f32.f16.f16.f32). Raises NotImplementedError
-        otherwise — used purely for ceiling measurement on the workhorse."""
-        if (self.arch, self.qualifier) != (
-            "Ampere", "m16n8k16.f32.f16.f16.f32"
-        ):
+        """Per-(arch, qualifier) specialized kernel. Dispatches at the
+        Python level; each target has a dedicated monomorphized PyO3
+        entry with all tile parameters as compile-time constants."""
+        fn_name = self._SPECIALIZED_FNS.get((self.arch, self.qualifier))
+        if fn_name is None:
             raise NotImplementedError(
-                "specialized kernel only supports Ampere m16n8k16.f32.f16.f16.f32"
+                f"specialized kernel not registered for "
+                f"({self.arch!r}, {self.qualifier!r})"
             )
-        assert A.shape[1:] == (16, 16)
-        assert B.shape[1:] == (16, 8)
-        assert C.shape[1:] == (16, 8)
+        assert A.shape[1:] == (self.m, self.k)
+        assert B.shape[1:] == (self.k, self.n)
+        assert C.shape[1:] == (self.m, self.n)
         A_f32, B_f32, C_f32 = self._prep_batched(A, B, C)
-        out = _rs.mma_ampere_f16_f32_batched_specialized(A_f32, B_f32, C_f32)
+        out = getattr(_rs, fn_name)(A_f32, B_f32, C_f32)
         return torch.from_numpy(out)

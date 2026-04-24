@@ -66,6 +66,17 @@ class mfma(amd.mfma):
         if self.is_xf32:
             A = truncate_to_tf32(A)
             B = truncate_to_tf32(B)
+        # Fix: `pairwise_dot` (and similarly `amd_fused_dot_rd_add`) assert
+        # f32 inputs because their inner math uses libm.fmaf. For f16/bf16
+        # operand types we therefore need to widen to f32 before entering
+        # the loop. Upstream MMA-Sim at 2511.10909 ships the assertion in
+        # place but with no cast here — the open-source release path is
+        # broken for CDNA1/2 f16/bf16 and CDNA3 f16/bf16/fp8. Widening is
+        # lossless (f16/bf16/fp8 values are exactly representable in f32).
+        if self.operation_type in ("pairwise", "fused_dot_rd_add") and \
+           A.dtype != torch.float32:
+            A = A.to(torch.float32)
+            B = B.to(torch.float32)
         for i in range(m):
             for j in range(n):
                 sum = C[i, j]

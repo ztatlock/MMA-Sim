@@ -72,9 +72,9 @@ _MIN_EXP = {
 }
 
 
-# AMD MFMA operation_type → supported kernel mapping (phase M3).
-# Only `fma` path supported today; `pairwise` and `fused_dot_rd_add`
-# are deferred.
+# AMD MFMA operation_type → supported kernel mapping.
+# Phase M3 added `fma` path; Phase N2 adds `pairwise` (CDNA1/2 f16/bf16).
+# `fused_dot_rd_add` (CDNA3 f16/bf16/fp8, xf32) still deferred (N3).
 _SUPPORTED_MFMA: set[tuple[str, str]] = {
     # CDNA2 f64 (operation_type = fma)
     ("CDNA2", "f64_16x16x4f64"),
@@ -99,6 +99,37 @@ _SUPPORTED_MFMA: set[tuple[str, str]] = {
     ("CDNA2", "f32_16x16x4f32"),
     ("CDNA2", "f32_16x16x1f32"),
     ("CDNA2", "f32_4x4x1f32"),
+    # ── Phase N2: pairwise path (CDNA1/2 f16/bf16) ──
+    # CDNA1 f16 (group_size=4, no flush)
+    ("CDNA1", "f32_32x32x8f16"),
+    ("CDNA1", "f32_32x32x4f16"),
+    ("CDNA1", "f32_16x16x16f16"),
+    ("CDNA1", "f32_16x16x4f16"),
+    ("CDNA1", "f32_4x4x4f16"),
+    # CDNA1 bf16 (group_size=2, no flush)
+    ("CDNA1", "f32_32x32x4bf16"),
+    ("CDNA1", "f32_32x32x2bf16"),
+    ("CDNA1", "f32_16x16x8bf16"),
+    ("CDNA1", "f32_16x16x2bf16"),
+    ("CDNA1", "f32_4x4x2bf16"),
+    # CDNA2 f16 (group_size=4, flush)
+    ("CDNA2", "f32_32x32x8f16"),
+    ("CDNA2", "f32_32x32x4f16"),
+    ("CDNA2", "f32_16x16x16f16"),
+    ("CDNA2", "f32_16x16x4f16"),
+    ("CDNA2", "f32_4x4x4f16"),
+    # CDNA2 bf16_1k (group_size=4, flush)
+    ("CDNA2", "f32_32x32x8bf16_1k"),
+    ("CDNA2", "f32_32x32x4bf16_1k"),
+    ("CDNA2", "f32_16x16x16bf16_1k"),
+    ("CDNA2", "f32_16x16x4bf16_1k"),
+    ("CDNA2", "f32_4x4x4bf16_1k"),
+    # CDNA2 bf16 (no suffix, group_size=2, flush)
+    ("CDNA2", "f32_32x32x4bf16"),
+    ("CDNA2", "f32_32x32x2bf16"),
+    ("CDNA2", "f32_16x16x8bf16"),
+    ("CDNA2", "f32_16x16x2bf16"),
+    ("CDNA2", "f32_4x4x2bf16"),
 }
 
 
@@ -445,6 +476,9 @@ class mfma:
         self.c_type = _ref.c_type
         self.d_type = _ref.d_type
         self.operation_type = _ref.operation_type
+        self.group_size = _ref.group_size
+        self.flush_denormal = _ref.flush_denormal
+        self.is_xf32 = _ref.is_xf32
 
         if (arch, qualifier) not in _SUPPORTED_MFMA:
             raise NotImplementedError(
@@ -464,14 +498,40 @@ class mfma:
             C64 = np.ascontiguousarray(C.detach().cpu().numpy(), dtype=np.float64)
             out = _rs.mma_f64_batched_rayon(A64[None], B64[None], C64[None])
             return torch.from_numpy(out[0])
-        elif self.d_type is torch.float32:
+        if self.operation_type == "pairwise":
+            # Widen A, B to f32 (matches the oracle patch). Flush A, B, C
+            # before widening if CDNA2.
+            A_pre = A.detach().cpu()
+            B_pre = B.detach().cpu()
+            C_pre = C.detach().cpu()
+            if self.flush_denormal:
+                # Match oracle's flush_denormal: in-place zero of subnormals.
+                def _flush(x):
+                    import mmasim.simulator.arithmetic as _ar
+                    min_e = _ar.dtype_min_exponent[x.dtype]
+                    x = x.clone()
+                    x[x.abs() < 2.0 ** min_e] = 0.0
+                    return x
+                A_pre = _flush(A_pre)
+                B_pre = _flush(B_pre)
+                C_pre = _flush(C_pre)
+            A32 = np.ascontiguousarray(A_pre.to(torch.float32).numpy(), dtype=np.float32)
+            B32 = np.ascontiguousarray(B_pre.to(torch.float32).numpy(), dtype=np.float32)
+            C32 = np.ascontiguousarray(C_pre.to(torch.float32).numpy(), dtype=np.float32)
+            out = _rs.mma_f32_amd_pairwise_rayon(
+                A32[None], B32[None], C32[None],
+                int(self.group_size), bool(self.flush_denormal),
+            )
+            return torch.from_numpy(out[0])
+        if self.d_type is torch.float32 and self.operation_type == "fma":
             A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
             B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
             C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
             out = _rs.mma_f32_fma_batched_rayon(A32[None], B32[None], C32[None])
             return torch.from_numpy(out[0])
-        else:
-            raise NotImplementedError(f"mfma d_type {self.d_type} not implemented")
+        raise NotImplementedError(
+            f"mfma operation_type={self.operation_type} d_type={self.d_type} not implemented"
+        )
 
 
 class mma_block_scale:

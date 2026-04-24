@@ -49,6 +49,12 @@ REGISTRY: list[InstSpec] = [
     InstSpec("amd-cdna2-f64",    "mfma", "CDNA2", "f64_16x16x4f64"),
     InstSpec("amd-cdna3-f64",    "mfma", "CDNA3", "f64_16x16x4_f64"),
     InstSpec("amd-cdna3-f32",    "mfma", "CDNA3", "f32_32x32x2_f32"),
+    # AMD pairwise path (CDNA1/2 f16/bf16) — phase N2.
+    InstSpec("amd-cdna1-f16",      "mfma", "CDNA1", "f32_32x32x8f16"),
+    InstSpec("amd-cdna1-bf16",     "mfma", "CDNA1", "f32_32x32x4bf16"),
+    InstSpec("amd-cdna2-f16",      "mfma", "CDNA2", "f32_32x32x8f16"),
+    InstSpec("amd-cdna2-bf16-1k",  "mfma", "CDNA2", "f32_32x32x8bf16_1k"),
+    InstSpec("amd-cdna2-bf16",     "mfma", "CDNA2", "f32_32x32x4bf16"),
     # Hopper wgmma — phase M4. f32-output subset.
     InstSpec("hopper-wgmma-f16-n64",  "wgmma", "Hopper", "m64n64k16.f32.f16.f16"),
     InstSpec("hopper-wgmma-bf16-n64", "wgmma", "Hopper", "m64n64k16.f32.bf16.bf16"),

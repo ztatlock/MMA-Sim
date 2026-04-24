@@ -1328,9 +1328,92 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_ampere_tf32, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_turing_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
     #[cfg(target_os = "macos")]
     m.add_function(wrap_pyfunction!(mma_metal_ampere_f16, &m)?)?;
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// M1b — F64 kernel.
+//
+// Oracle ([nv_ptx.py:70-71]) does serial `libm.fma(a, b, sum)` across k
+// per output. Rust's `f64::mul_add` compiles to the hardware FMA
+// instruction on modern aarch64 / x86 — IEEE-754 fused with single
+// rounding, same as libm.fma.
+//
+// No integer pipeline here; f64 precision is the oracle's precision.
+// ─────────────────────────────────────────────────────────────────────
+
+#[inline]
+fn run_one_tile_f64(
+    a: &[f64], b: &[f64], c: &[f64],
+    m: usize, n: usize, k: usize,
+    out: &mut [f64],
+) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = c[i * n + j];
+            for l in 0..k {
+                sum = a[i * k + l].mul_add(b[l * n + j], sum);
+            }
+            out[i * n + j] = sum;
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c))]
+fn mma_f64_batched_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f64>,
+    b: PyReadonlyArray3<'py, f64>,
+    c: PyReadonlyArray3<'py, f64>,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+
+    let a_owned: Vec<f64>;
+    let a_slice: &[f64] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f64>;
+    let b_slice: &[f64] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f64>;
+    let c_slice: &[f64] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0.0f64; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((o, a), b), c)| {
+                run_one_tile_f64(a, b, c, m, n, k, o);
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
 }
 
 /// Phase 4 — Metal GPU backend for ampere-f16 workhorse.

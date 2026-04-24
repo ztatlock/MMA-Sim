@@ -34,6 +34,11 @@ _SUPPORTED: set[tuple[str, str]] = {
     ("Ada Lovelace", "m16n8k16.f32.e5m2.e4m3.f32"),
     ("Ada Lovelace", "m16n8k16.f32.e4m3.e5m2.f32"),
     ("Ada Lovelace", "m16n8k16.f32.e4m3.e4m3.f32"),
+    # F64 — uses dedicated `mma_f64_batched_rayon` Rust entry (serial FMA).
+    ("Ampere", "m8n8k4.f64.f64.f64.f64"),
+    ("Hopper", "m16n8k16.f64.f64.f64.f64"),
+    ("Hopper", "m16n8k8.f64.f64.f64.f64"),
+    ("Hopper", "m16n8k4.f64.f64.f64.f64"),
 }
 
 
@@ -82,6 +87,9 @@ class mma:
         return np.ascontiguousarray(a, dtype=np.float32)
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        if self.d_type is torch.float64:
+            return self._call_f64_single(A, B, C)
+
         A_f32 = self._to_f32_contig(A)
         B_f32 = self._to_f32_contig(B)
         C_f32 = self._to_f32_contig(C)
@@ -103,6 +111,14 @@ class mma:
             self.is_split_k,
         )
         return torch.from_numpy(out)
+
+    def _call_f64_single(self, A, B, C):
+        # Single-call f64: route through the batched entry with batch=1.
+        A_f64 = np.ascontiguousarray(A.detach().cpu().numpy(), dtype=np.float64)
+        B_f64 = np.ascontiguousarray(B.detach().cpu().numpy(), dtype=np.float64)
+        C_f64 = np.ascontiguousarray(C.detach().cpu().numpy(), dtype=np.float64)
+        out = _rs.mma_f64_batched_rayon(A_f64[None], B_f64[None], C_f64[None])
+        return torch.from_numpy(out[0])
 
     def _prep_batched(self, A, B, C):
         A_f32 = np.ascontiguousarray(

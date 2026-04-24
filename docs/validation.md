@@ -124,3 +124,33 @@ Even though we don't re-run silicon tests, these are worth maintaining:
   catches accidental slowdowns).
 
 Everything else is the paper's problem.
+
+## Known caveat: AMD CDNA1/2 pairwise paths
+
+The upstream oracle at commit `c785138` (our fork base) has an
+assertion-vs-input-dtype mismatch for the AMD `pairwise`
+operation_type:
+
+- [`arithmetic.py::pairwise_dot`](../mmasim/simulator/arithmetic.py) begins with `assert a.dtype == b.dtype == torch.float32`.
+- [`amd.py::mfma.__call__`](../mmasim/simulator/amd.py) invokes `pairwise_dot(A[i, l:l+gs], B[l:l+gs, j], ...)` where A, B have the source dtype (f16 or bf16 for CDNA1/2 pairwise instructions).
+
+Running the oracle as-shipped on CDNA1 f16/bf16 or CDNA2 f16/bf16
+MFMA instructions raises `AssertionError` immediately. We have a
+local patch that widens A, B to f32 before the pairwise loop, which
+is lossless. But because the oracle-as-shipped doesn't run, the
+upstream silicon-validation claim for these ~10 qualifiers is
+unverified from our vantage point. Our `fastmma.rust_ref` is
+bit-exact against our *patched* oracle; whether the patch matches
+the authors' intended semantics is an open question.
+
+**Status:** under investigation (see
+[logs/2026-04-24-amd-oracle-investigation-plan.md](../logs/2026-04-24-amd-oracle-investigation-plan.md)).
+We will not file upstream until we're confident the bug is real and
+our fix is right — the worst outcome is wasting the authors' time or
+looking sloppy.
+
+**Scope of caveat:** AMD CDNA1 f16/bf16 + CDNA2 f16/bf16 MFMA
+instructions only. All other supported (NVIDIA mma/wgmma/tcgen05mma/
+mma_block_scale, AMD f64, AMD f32 fma, AMD CDNA3 fused_dot_rd_add)
+paths are unaffected by this caveat — they pass through code paths
+that don't hit the assertion.

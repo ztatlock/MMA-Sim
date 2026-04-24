@@ -97,6 +97,20 @@ dispatch through `fastmma.rust_ref`.
 - mxfp4 with ue4m3 scales (non-power-of-2; needs scale-sig handling).
 - fp6 e3m2/e2m3 (upstream oracle marks these "TODO" too).
 
+### Immediate priority: AMD pairwise oracle-bug investigation
+
+Phase N2 exposed what looks like a real upstream bug in the AMD
+CDNA1/2 pairwise path (assertion-vs-dtype mismatch; oracle can't run
+as-shipped). We patched locally, but the chain of trust is weaker
+for these ~10 qualifiers until we verify the fix against the paper's
+intent.
+
+Plan: [logs/2026-04-24-amd-oracle-investigation-plan.md](logs/2026-04-24-amd-oracle-investigation-plan.md).
+
+**Do not file upstream until investigation complete.** Paper authors
+are credible; wasting their time or looking sloppy would be worse
+than the few days it takes to validate properly.
+
 ### Branch B — Validation against real silicon (priority: high)
 
 Our bit-exactness is *relative to the Python oracle*, which itself has

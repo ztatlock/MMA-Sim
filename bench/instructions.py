@@ -15,7 +15,7 @@ from . import _compat  # noqa: F401  (side effect: libm shim)
 
 import torch
 
-from mmasim.simulator.nv_ptx import mma, mma_block_scale
+from mmasim.simulator.nv_ptx import mma, mma_block_scale, wgmma, tcgen05mma
 from mmasim.simulator.amd import mfma
 
 
@@ -49,6 +49,10 @@ REGISTRY: list[InstSpec] = [
     InstSpec("amd-cdna2-f64",    "mfma", "CDNA2", "f64_16x16x4f64"),
     InstSpec("amd-cdna3-f64",    "mfma", "CDNA3", "f64_16x16x4_f64"),
     InstSpec("amd-cdna3-f32",    "mfma", "CDNA3", "f32_32x32x2_f32"),
+    # Hopper wgmma — phase M4. f32-output subset.
+    InstSpec("hopper-wgmma-f16-n64",  "wgmma", "Hopper", "m64n64k16.f32.f16.f16"),
+    InstSpec("hopper-wgmma-bf16-n64", "wgmma", "Hopper", "m64n64k16.f32.bf16.bf16"),
+    InstSpec("hopper-wgmma-tf32-n64", "wgmma", "Hopper", "m64n64k8.f32.tf32.tf32"),
 ]
 
 
@@ -59,6 +63,10 @@ def make(spec: InstSpec) -> Any:
         return mma_block_scale(spec.arch, spec.qualifier)
     if spec.kind == "mfma":
         return mfma(spec.arch, spec.qualifier)
+    if spec.kind == "wgmma":
+        return wgmma(spec.arch, spec.qualifier)
+    if spec.kind == "tcgen05mma":
+        return tcgen05mma(spec.arch, spec.qualifier)
     raise ValueError(f"unknown kind: {spec.kind}")
 
 

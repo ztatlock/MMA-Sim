@@ -327,6 +327,71 @@ class mma:
         return torch.from_numpy(out)
 
 
+_SUPPORTED_WGMMA: set[tuple[str, str]] = {
+    # Hopper wgmma, f32-output subset (Phase M4). f16-output would need
+    # RNE instead of our RZ — deferred.
+    ("Hopper", "m64n64k16.f32.f16.f16"),
+    ("Hopper", "m64n64k16.f32.bf16.bf16"),
+    ("Hopper", "m64n64k8.f32.tf32.tf32"),
+    ("Hopper", "m64n128k16.f32.f16.f16"),
+    ("Hopper", "m64n128k16.f32.bf16.bf16"),
+    ("Hopper", "m64n128k8.f32.tf32.tf32"),
+    ("Hopper", "m64n256k16.f32.f16.f16"),
+    ("Hopper", "m64n256k8.f32.tf32.tf32"),
+    ("Hopper", "m64n8k16.f32.f16.f16"),
+    ("Hopper", "m64n8k16.f32.bf16.bf16"),
+    ("Hopper", "m64n8k8.f32.tf32.tf32"),
+}
+
+
+class wgmma:
+    """Rust-backed Hopper wgmma. f32-output subset only."""
+
+    def __init__(self, arch: str, qualifier: str):
+        from mmasim.simulator.nv_ptx import wgmma as _oracle_wgmma
+        _ref = _oracle_wgmma(arch, qualifier)
+        self.arch = arch
+        self.qualifier = qualifier
+        self.m, self.n, self.k = _ref.m, _ref.n, _ref.k
+        self.a_type = _ref.a_type
+        self.b_type = _ref.b_type
+        self.c_type = _ref.c_type
+        self.d_type = _ref.d_type
+        self.nfb = _ref.n_accum_fractional_bits
+        self.output_type = _ref.output_type
+
+        if (arch, qualifier) not in _SUPPORTED_WGMMA:
+            raise NotImplementedError(
+                f"rust_ref.wgmma: ({arch!r}, {qualifier!r}) not supported"
+            )
+
+        if self.d_type is not torch.float32:
+            raise NotImplementedError(
+                f"wgmma f16-output variants need RNE (deferred)"
+            )
+
+        self._out_mant_bits = 13 if self.output_type == "f32_e8m13" else 23
+        self._a_min = _MIN_EXP[self.a_type]
+        self._b_min = _MIN_EXP[self.b_type]
+        self._c_min = _MIN_EXP[self.c_type]
+
+    def __call__(self, A, B, C):
+        assert A.shape == (self.m, self.k)
+        assert B.shape == (self.k, self.n)
+        assert C.shape == (self.m, self.n)
+        A32 = np.ascontiguousarray(A.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+        B32 = np.ascontiguousarray(B.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+        C32 = np.ascontiguousarray(C.detach().cpu().to(torch.float32).numpy(), dtype=np.float32)
+        if self.a_type is torch.float32:  # tf32
+            A32 = np.ascontiguousarray(((A32.view(np.int32) >> 13) << 13).view(np.float32))
+            B32 = np.ascontiguousarray(((B32.view(np.int32) >> 13) << 13).view(np.float32))
+        out = _rs.mma_f32_out_wgmma_batched_rayon(
+            A32[None], B32[None], C32[None],
+            self.nfb, self._a_min, self._b_min, self._c_min, self._out_mant_bits,
+        )
+        return torch.from_numpy(out[0])
+
+
 class mfma:
     """AMD MFMA reimplementation (Phase M3, narrow scope).
 

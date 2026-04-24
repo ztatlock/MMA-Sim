@@ -763,6 +763,147 @@ fn mma_f32_out_batched_simd<'py>(
 // other Python threads can progress; our inner work is pure Rust.
 // ─────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────
+// M4 — Heap-allocated generic kernel for large tiles (wgmma, tcgen05mma).
+//
+// Wgmma tiles can be up to m=64, n=256, k=32, so m*k and k*n exceed
+// MAX_ELEMS=256. This variant uses Vec<i64> for the per-tile decompose
+// buffers. Vec::with_capacity + unsafe set_len is used to skip
+// zero-initialization (buffers are immediately overwritten).
+// Same kernel math as fused_mma_step_int.
+// ─────────────────────────────────────────────────────────────────────
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_one_tile_heap(
+    a: &[f32], b: &[f32], c: &[f32],
+    m: usize, n: usize, k: usize,
+    nfb: i32,
+    a_min_exp: i32, b_min_exp: i32, c_min_exp: i32,
+    out_mantissa_bits: i32,
+    out: &mut [f32],
+) {
+    let mut a_sig = vec![0i64; m * k];
+    let mut a_exp = vec![0i32; m * k];
+    for idx in 0..m * k {
+        let (s, e, _) = decompose(a[idx], a_min_exp, nfb);
+        a_sig[idx] = s;
+        a_exp[idx] = e;
+    }
+    let mut b_sig = vec![0i64; k * n];
+    let mut b_exp = vec![0i32; k * n];
+    for idx in 0..k * n {
+        let (s, e, _) = decompose(b[idx], b_min_exp, nfb);
+        b_sig[idx] = s;
+        b_exp[idx] = e;
+    }
+
+    // Per-output k-loop buffers stay on the stack; k ≤ 32 for wgmma.
+    for i in 0..m {
+        for j in 0..n {
+            let (c_sig_ij, c_exp_ij, _) = decompose(c[i * n + j], c_min_exp, nfb);
+            let mut fp_sum = c[i * n + j] as f64;
+
+            let mut prod_sig = [0i64; 64];
+            let mut prod_exp = [0i32; 64];
+            let mut max_e = c_exp_ij;
+            assert!(k <= 64, "wgmma k must be <= 64");
+
+            for l in 0..k {
+                let a_s = a_sig[i * k + l];
+                let a_e = a_exp[i * k + l];
+                let b_s = b_sig[l * n + j];
+                let b_e = b_exp[l * n + j];
+
+                fp_sum += (a[i * k + l] as f64) * (b[l * n + j] as f64);
+
+                let ps = a_s * b_s;
+                let pe = a_e + b_e;
+                prod_sig[l] = ps;
+                prod_exp[l] = pe;
+                if pe > max_e { max_e = pe; }
+            }
+
+            let result_f64 = if !fp_sum.is_finite() {
+                fp_sum
+            } else {
+                let mut acc: i64 = trunc_shr(c_sig_ij, max_e - c_exp_ij);
+                for l in 0..k {
+                    let shift = max_e - prod_exp[l] + nfb;
+                    acc += trunc_shr(prod_sig[l], shift);
+                }
+                (acc as f64) * fast_pow2(max_e - nfb)
+            };
+
+            out[i * n + j] = normalize_f32(result_f64, out_mantissa_bits);
+        }
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits))]
+#[allow(clippy::too_many_arguments)]
+fn mma_f32_out_wgmma_batched_rayon<'py>(
+    py: Python<'py>,
+    a: PyReadonlyArray3<'py, f32>,
+    b: PyReadonlyArray3<'py, f32>,
+    c: PyReadonlyArray3<'py, f32>,
+    nfb: i32,
+    a_min_exp: i32,
+    b_min_exp: i32,
+    c_min_exp: i32,
+    out_mantissa_bits: i32,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let a_v = a.as_array();
+    let b_v = b.as_array();
+    let c_v = c.as_array();
+    let batch = a_v.shape()[0];
+    let m = a_v.shape()[1];
+    let k = a_v.shape()[2];
+    let n = b_v.shape()[2];
+    assert_eq!(b_v.shape(), &[batch, k, n]);
+    assert_eq!(c_v.shape(), &[batch, m, n]);
+
+    let a_owned: Vec<f32>;
+    let a_slice: &[f32] = match a_v.as_slice() {
+        Some(s) => s,
+        None => { a_owned = a_v.iter().copied().collect(); &a_owned }
+    };
+    let b_owned: Vec<f32>;
+    let b_slice: &[f32] = match b_v.as_slice() {
+        Some(s) => s,
+        None => { b_owned = b_v.iter().copied().collect(); &b_owned }
+    };
+    let c_owned: Vec<f32>;
+    let c_slice: &[f32] = match c_v.as_slice() {
+        Some(s) => s,
+        None => { c_owned = c_v.iter().copied().collect(); &c_owned }
+    };
+
+    let mut out = vec![0f32; batch * m * n];
+    let a_stride = m * k;
+    let b_stride = k * n;
+    let c_stride = m * n;
+
+    py.allow_threads(|| {
+        out.par_chunks_mut(c_stride)
+            .zip(a_slice.par_chunks(a_stride))
+            .zip(b_slice.par_chunks(b_stride))
+            .zip(c_slice.par_chunks(c_stride))
+            .for_each(|(((o, a), b), c)| {
+                run_one_tile_heap(
+                    a, b, c, m, n, k,
+                    nfb, a_min_exp, b_min_exp, c_min_exp,
+                    out_mantissa_bits, o,
+                );
+            });
+    });
+
+    let arr = ndarray::Array3::from_shape_vec((batch, m, n), out)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(arr.into_pyarray_bound(py))
+}
+
 #[pyfunction]
 #[pyo3(signature = (a, b, c, nfb, a_min_exp, b_min_exp, c_min_exp, out_mantissa_bits, split_k))]
 #[allow(clippy::too_many_arguments)]
@@ -1330,6 +1471,7 @@ fn fastmma_rust(_py: Python<'_>, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mma_spec_volta_f16, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f64_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_fma_batched_rayon, &m)?)?;
+    m.add_function(wrap_pyfunction!(mma_f32_out_wgmma_batched_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_block_scale_k32_rayon, &m)?)?;
     m.add_function(wrap_pyfunction!(mma_f32_out_mxfp4_k64_rayon, &m)?)?;
     #[cfg(target_os = "macos")]

@@ -72,6 +72,8 @@ def main() -> None:
             "mma": "mma",
             "mma_block_scale": "mma_block_scale",
             "mfma": "mfma",
+            "wgmma": "wgmma",
+            "tcgen05mma": "tcgen05mma",
         }[spec["kind"]]
         ctor = getattr(impl_mod, ctor_name, None)
         if ctor is None:
@@ -120,13 +122,19 @@ def main() -> None:
         median_ms = statistics.median(times) * 1000
 
         # We need the oracle's timing for speedup. Run it once more here.
-        from mmasim.simulator.nv_ptx import mma as _oracle_mma
-        from mmasim.simulator.nv_ptx import mma_block_scale as _oracle_mbs
+        from mmasim.simulator.nv_ptx import (
+            mma as _oracle_mma,
+            mma_block_scale as _oracle_mbs,
+            wgmma as _oracle_wgmma,
+            tcgen05mma as _oracle_tcgen05,
+        )
         from mmasim.simulator.amd import mfma as _oracle_mfma
         oracle_ctor = {
             "mma": _oracle_mma,
             "mma_block_scale": _oracle_mbs,
             "mfma": _oracle_mfma,
+            "wgmma": _oracle_wgmma,
+            "tcgen05mma": _oracle_tcgen05,
         }[spec["kind"]]
         oracle = oracle_ctor(spec["arch"], spec["qualifier"])
 
